@@ -1,5 +1,7 @@
 import os, sys
-sys.path.append(os.getenv('LLAVA_HOME'))
+llava_home = os.getenv('LLAVA_HOME')
+if llava_home:
+    sys.path.append(llava_home)
 
 from collections import defaultdict
 import numpy as np
