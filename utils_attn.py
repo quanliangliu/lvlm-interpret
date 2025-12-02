@@ -87,16 +87,23 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
     
     # Get model-specific parameters
     is_mllama = getattr(state, 'is_mllama', False)
+    is_qwen_vl = getattr(state, 'is_qwen_vl', False)
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
+    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
+    image_grid_hw = getattr(state, 'image_grid_hw', None)
     
-    # Calculate grid size for visualization
-    if num_image_tokens == 576:
-        grid_size = 24
+    # Calculate grid dimensions for visualization
+    if image_grid_hw is not None:
+        # Qwen VL with dynamic resolution - use actual grid dimensions
+        grid_h, grid_w = image_grid_hw
+        logger.debug(f"Using Qwen VL grid dimensions: {grid_h}x{grid_w}")
+    elif num_image_tokens == 576:
+        grid_h, grid_w = 24, 24
     else:
-        # For Mllama or other models with different image token counts
-        grid_size = int(np.sqrt(num_image_tokens))
-        if grid_size * grid_size != num_image_tokens:
-            logger.warning(f"Non-square image token count: {num_image_tokens}, using grid_size={grid_size}")
+        # For Mllama or other models - try to infer square grid
+        grid_h = grid_w = int(np.sqrt(num_image_tokens))
+        if grid_h * grid_w != num_image_tokens:
+            logger.warning(f"Non-square image token count: {num_image_tokens}, using grid_size={grid_h}")
 
     if highlighted_text is not None:
         generated_text = state.output_ids_decoded
@@ -162,22 +169,31 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
                 
                 if actual_img_tokens > 0:
                     img_attn_raw = mh_attention[head_idx, img_idx:img_end_idx].float().cpu().numpy()
-                    # Reshape to grid, handling non-square cases
-                    if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
-                        img_attn_token = img_attn_raw.reshape(grid_size, grid_size)
+                    # Reshape to grid using actual dimensions
+                    from scipy.ndimage import zoom
+                    target_size = 24  # Standard output size for visualization
+                    
+                    if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
+                        # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                        img_attn_grid = img_attn_raw.reshape(grid_h, grid_w)
+                        # Resize to target visualization size while preserving aspect ratio
+                        zoom_factors = (target_size / grid_h, target_size / grid_w)
+                        img_attn_token = zoom(img_attn_grid, zoom_factors, order=1)
                     else:
-                        # Interpolate to standard visualization size
-                        from scipy.ndimage import zoom
-                        target_size = 24
+                        # Fallback: interpolate to standard visualization size
                         img_attn_token = np.zeros((target_size, target_size))
                         if actual_img_tokens > 0:
-                            # Create a 1D representation and interpolate to 2D
-                            side = int(np.ceil(np.sqrt(actual_img_tokens)))
-                            padded = np.zeros(side * side)
+                            # Try to infer grid dimensions
+                            if image_grid_hw is not None:
+                                inferred_h, inferred_w = image_grid_hw
+                            else:
+                                inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                            # Pad if needed
+                            padded = np.zeros(inferred_h * inferred_w)
                             padded[:actual_img_tokens] = img_attn_raw
-                            padded = padded.reshape(side, side)
-                            zoom_factor = target_size / side
-                            img_attn_token = zoom(padded, zoom_factor, order=1)
+                            padded = padded.reshape(inferred_h, inferred_w)
+                            zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                            img_attn_token = zoom(padded, zoom_factors, order=1)
                 else:
                     img_attn_token = np.zeros((24, 24))
 
@@ -219,8 +235,19 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
     
     # Get model-specific parameters
     is_mllama = getattr(state, 'is_mllama', False)
+    is_qwen_vl = getattr(state, 'is_qwen_vl', False)
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
+    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
+    image_grid_hw = getattr(state, 'image_grid_hw', None)
+    
+    # Calculate grid dimensions
+    if image_grid_hw is not None:
+        # Qwen VL with dynamic resolution - use actual grid dimensions
+        grid_h, grid_w = image_grid_hw
+    elif num_image_tokens == 576:
+        grid_h, grid_w = 24, 24
+    else:
+        grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     word_rel_maps = torch.load(fn_attention)
     if type_selector not in word_rel_maps:
@@ -240,21 +267,30 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 actual_img_tokens = img_end_idx - img_idx
                 rel_map_img = rel_map[-1,:][img_idx:img_end_idx].float().cpu().numpy()
                 
-                # Reshape to grid, handling different sizes
-                if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
-                    rel_map = rel_map_img.reshape(grid_size, grid_size)
+                # Reshape to grid using actual dimensions, handling non-square grids
+                from scipy.ndimage import zoom
+                target_size = 24  # Standard output size for visualization
+                
+                if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
+                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                    rel_map_grid = rel_map_img.reshape(grid_h, grid_w)
+                    # Resize to target visualization size
+                    zoom_factors = (target_size / grid_h, target_size / grid_w)
+                    rel_map = zoom(rel_map_grid, zoom_factors, order=1)
                 else:
-                    # Interpolate to 24x24 for visualization
-                    from scipy.ndimage import zoom
+                    # Fallback: interpolate to standard visualization size
                     if actual_img_tokens > 0:
-                        side = int(np.ceil(np.sqrt(actual_img_tokens)))
-                        padded = np.zeros(side * side)
+                        if image_grid_hw is not None:
+                            inferred_h, inferred_w = image_grid_hw
+                        else:
+                            inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        padded = np.zeros(inferred_h * inferred_w)
                         padded[:actual_img_tokens] = rel_map_img
-                        padded = padded.reshape(side, side)
-                        zoom_factor = 24 / side
-                        rel_map = zoom(padded, zoom_factor, order=1)
+                        padded = padded.reshape(inferred_h, inferred_w)
+                        zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                        rel_map = zoom(padded, zoom_factors, order=1)
                     else:
-                        rel_map = np.zeros((24, 24))
+                        rel_map = np.zeros((target_size, target_size))
                 normalize_image_tokens = True
             if incude_text_relevancy:
                 input_text_tokenized = state.input_text_tokenized
@@ -272,23 +308,33 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 logger.debug(f'shape of rel_maps_no_system: {rel_maps_no_system.shape}')
                 rel_maps_no_system = (rel_maps_no_system - rel_maps_no_system.min()) / (rel_maps_no_system.max() - rel_maps_no_system.min() + 1e-8)
                 
-                # Get image portion and reshape
+                # Get image portion and reshape using actual grid dimensions
                 actual_img_tokens = img_end_idx - img_idx_int
                 rel_map_img = rel_maps_no_system[:actual_img_tokens].cpu().numpy()
                 
-                if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
-                    rel_map = rel_map_img.reshape(grid_size, grid_size)
+                from scipy.ndimage import zoom
+                target_size = 24  # Standard output size for visualization
+                
+                if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
+                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                    rel_map_grid = rel_map_img.reshape(grid_h, grid_w)
+                    # Resize to target visualization size
+                    zoom_factors = (target_size / grid_h, target_size / grid_w)
+                    rel_map = zoom(rel_map_grid, zoom_factors, order=1)
                 else:
-                    from scipy.ndimage import zoom
+                    # Fallback: interpolate to standard visualization size
                     if actual_img_tokens > 0:
-                        side = int(np.ceil(np.sqrt(actual_img_tokens)))
-                        padded = np.zeros(side * side)
+                        if image_grid_hw is not None:
+                            inferred_h, inferred_w = image_grid_hw
+                        else:
+                            inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        padded = np.zeros(inferred_h * inferred_w)
                         padded[:actual_img_tokens] = rel_map_img
-                        padded = padded.reshape(side, side)
-                        zoom_factor = 24 / side
-                        rel_map = zoom(padded, zoom_factor, order=1)
+                        padded = padded.reshape(inferred_h, inferred_w)
+                        zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                        rel_map = zoom(padded, zoom_factors, order=1)
                     else:
-                        rel_map = np.zeros((24, 24))
+                        rel_map = np.zeros((target_size, target_size))
                 normalize_image_tokens = False
         else:
             # ViT relevancy map
@@ -474,7 +520,16 @@ def plot_attention_analysis(state, attn_modality_select):
     
     # Get model-specific parameters
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
+    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
+    image_grid_hw = getattr(state, 'image_grid_hw', None)
+    
+    # Calculate grid dimensions
+    if image_grid_hw is not None:
+        grid_h, grid_w = image_grid_hw
+    elif num_image_tokens == 576:
+        grid_h, grid_w = 24, 24
+    else:
+        grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     if os.path.exists(fn_attention):
         attentions = torch.load(fn_attention)
@@ -504,18 +559,27 @@ def plot_attention_analysis(state, attn_modality_select):
                     actual_tokens = img_end_idx - img_idx
                     if actual_tokens > 0:
                         attn_slice = mh_attention[head_idx, img_idx:img_end_idx].float().cpu()
-                        # Pad or reshape as needed
-                        if actual_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
-                            img_attn_list.append(attn_slice.reshape(grid_size, grid_size))
+                        # Reshape using actual grid dimensions
+                        from scipy.ndimage import zoom
+                        target_size = 24  # Standard output size
+                        
+                        if actual_tokens == num_image_tokens and actual_tokens == grid_h * grid_w:
+                            # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                            attn_grid = attn_slice.reshape(grid_h, grid_w).numpy()
+                            # Resize to standard visualization size
+                            zoom_factors = (target_size / grid_h, target_size / grid_w)
+                            img_attn_list.append(torch.tensor(zoom(attn_grid, zoom_factors, order=1)))
                         else:
-                            # Interpolate to standard grid
-                            from scipy.ndimage import zoom
-                            side = int(np.ceil(np.sqrt(actual_tokens)))
-                            padded = torch.zeros(side * side)
+                            # Fallback: interpolate to standard grid
+                            if image_grid_hw is not None:
+                                inferred_h, inferred_w = image_grid_hw
+                            else:
+                                inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
+                            padded = torch.zeros(inferred_h * inferred_w)
                             padded[:actual_tokens] = attn_slice
-                            padded = padded.reshape(side, side).numpy()
-                            zoom_factor = grid_size / side
-                            img_attn_list.append(torch.tensor(zoom(padded, zoom_factor, order=1)))
+                            padded = padded.reshape(inferred_h, inferred_w).numpy()
+                            zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                            img_attn_list.append(torch.tensor(zoom(padded, zoom_factors, order=1)))
                 if img_attn_list:
                     img_attn = torch.stack(img_attn_list).numpy()
                     heatmap_mean[layer_idx][head_idx] = img_attn.mean()
@@ -553,7 +617,16 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
     
     # Get model-specific parameters
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
+    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
+    image_grid_hw = getattr(state, 'image_grid_hw', None)
+    
+    # Calculate grid dimensions
+    if image_grid_hw is not None:
+        grid_h, grid_w = image_grid_hw
+    elif num_image_tokens == 576:
+        grid_h, grid_w = 24, 24
+    else:
+        grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     # Sliders start at 1
     head_idx -= 1
@@ -574,6 +647,7 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
         return state, None
     
     mh_attentions = []
+    target_size = 24  # Standard output size for visualization
     for head_id in range(num_heads):
         att_per_head = []
         for i, out_att in enumerate(attentions):
@@ -584,19 +658,27 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
             
             if actual_tokens > 0:
                 att_raw = mh_attention.squeeze()[head_id, img_idx:img_end_idx]
-                if actual_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
-                    att_img = att_raw.reshape(grid_size, grid_size)
+                from scipy.ndimage import zoom
+                
+                if actual_tokens == num_image_tokens and actual_tokens == grid_h * grid_w:
+                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                    att_grid = att_raw.reshape(grid_h, grid_w).cpu().numpy()
+                    # Resize to standard visualization size
+                    zoom_factors = (target_size / grid_h, target_size / grid_w)
+                    att_img = torch.tensor(zoom(att_grid, zoom_factors, order=1))
                 else:
-                    # Interpolate to 24x24 grid for visualization
-                    from scipy.ndimage import zoom
-                    side = int(np.ceil(np.sqrt(actual_tokens)))
-                    padded = torch.zeros(side * side)
+                    # Fallback: interpolate to standard grid
+                    if image_grid_hw is not None:
+                        inferred_h, inferred_w = image_grid_hw
+                    else:
+                        inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
+                    padded = torch.zeros(inferred_h * inferred_w)
                     padded[:actual_tokens] = att_raw
-                    padded = padded.reshape(side, side).cpu().numpy()
-                    zoom_factor = 24 / side
-                    att_img = torch.tensor(zoom(padded, zoom_factor, order=1))
+                    padded = padded.reshape(inferred_h, inferred_w).cpu().numpy()
+                    zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                    att_img = torch.tensor(zoom(padded, zoom_factors, order=1))
             else:
-                att_img = torch.zeros((24, 24))
+                att_img = torch.zeros((target_size, target_size))
             att_per_head.append(att_img)
         att_per_head = torch.stack(att_per_head)
         mh_attentions.append(att_per_head)
