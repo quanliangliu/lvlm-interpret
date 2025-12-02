@@ -162,6 +162,17 @@ def compute_word_rel_map(tokens, target_index, R_i_i, separators_list,
 
 def construct_relevancy_map(tokenizer, model, input_ids, tokens, outputs, output_ids, img_idx, apply_normalization=True, progress=gr.Progress(track_tqdm=True)):
     logger.debug('Tokens: %s', tokens)
+    
+    # Check if this is a Mllama model
+    is_mllama = getattr(model, 'is_mllama', False)
+    
+    # For Mllama, the number of image tokens in the input is different
+    # Mllama uses cross-attention, so only 1 placeholder token in input_ids
+    if is_mllama:
+        num_image_tokens = 1
+    else:
+        num_image_tokens = 576  # LLaVA uses 24x24 = 576 image patches
+    
     enable_vit_relevancy = len(model.enc_attn_weights_vit) > 0
     if enable_vit_relevancy:
         enc_attn_weights_vit = model.enc_attn_weights_vit

@@ -1,3 +1,9 @@
+import sys
+sys.path = [p for p in sys.path if p is not None]
+
+import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"  # Disable torch.compile
+
 import argparse 
 import logging
 
@@ -6,11 +12,15 @@ from utils_gradio import build_demo
 
 logging.basicConfig(level=logging.INFO)
 
+# Supported models:
+# - LLaVA models: "Intel/llava-gemma-2b", "Intel/llava-gemma-7b", "llava-hf/llava-1.5-7b-hf", etc.
+# - Llama 3.2 Vision models: "meta-llama/Llama-3.2-11B-Vision-Instruct", "meta-llama/Llama-3.2-90B-Vision-Instruct"
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--model_name_or_path", type=str, default="Intel/llava-gemma-2b",
-                        help="Model name or path to load the model from")
+                        help="Model name or path to load. Supports LLaVA models and Llama 3.2 Vision models.")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Host to run the server on")
     parser.add_argument("--port", type=int, default=7860,

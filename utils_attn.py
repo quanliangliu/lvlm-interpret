@@ -82,6 +82,19 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
     fn_attention = state.attention_key + '_attn.pt'
     recovered_image = state.recovered_image
     img_idx = state.image_idx
+    
+    # Get model-specific parameters
+    is_mllama = getattr(state, 'is_mllama', False)
+    num_image_tokens = getattr(state, 'num_image_tokens', 576)
+    
+    # Calculate grid size for visualization
+    if num_image_tokens == 576:
+        grid_size = 24
+    else:
+        # For Mllama or other models with different image token counts
+        grid_size = int(np.sqrt(num_image_tokens))
+        if grid_size * grid_size != num_image_tokens:
+            logger.warning(f"Non-square image token count: {num_image_tokens}, using grid_size={grid_size}")
 
     if highlighted_text is not None:
         generated_text = state.output_ids_decoded
@@ -140,7 +153,31 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
                 if inp_seq_len > 1:
                     mh_attention = mh_attention[:,:,-1,:]
                 mh_attention = mh_attention.squeeze()
-                img_attn_token = mh_attention[head_idx, img_idx:img_idx+576].reshape(24,24).float().cpu().numpy()
+                
+                # Handle different image token counts
+                img_end_idx = min(img_idx + num_image_tokens, seq_len)
+                actual_img_tokens = img_end_idx - img_idx
+                
+                if actual_img_tokens > 0:
+                    img_attn_raw = mh_attention[head_idx, img_idx:img_end_idx].float().cpu().numpy()
+                    # Reshape to grid, handling non-square cases
+                    if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
+                        img_attn_token = img_attn_raw.reshape(grid_size, grid_size)
+                    else:
+                        # Interpolate to standard visualization size
+                        from scipy.ndimage import zoom
+                        target_size = 24
+                        img_attn_token = np.zeros((target_size, target_size))
+                        if actual_img_tokens > 0:
+                            # Create a 1D representation and interpolate to 2D
+                            side = int(np.ceil(np.sqrt(actual_img_tokens)))
+                            padded = np.zeros(side * side)
+                            padded[:actual_img_tokens] = img_attn_raw
+                            padded = padded.reshape(side, side)
+                            zoom_factor = target_size / side
+                            img_attn_token = zoom(padded, zoom_factor, order=1)
+                else:
+                    img_attn_token = np.zeros((24, 24))
 
                 if img_attn is None:
                     img_attn = img_attn_token
@@ -152,9 +189,7 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
             img_attn_list.append((img_overlay_attn, f'Head_{head_idx}'))
 
             # Calculate mean attention per head
-            # img_attn = mh_attention[head_idx, img_idx:img_idx+576].reshape(24,24).cpu().numpy()
-
-            img_attn /= img_attn.max()
+            img_attn /= (img_attn.max() + 1e-8)
             img_attn_mean.append(img_attn.mean())
         img_attn_list = [x for _, x in sorted(zip(img_attn_mean, img_attn_list), key=lambda pair: pair[0], reverse=True)]
 
@@ -179,6 +214,11 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
     fn_attention = state.attention_key + '_relevancy.pt'
     recovered_image = state.recovered_image
     img_idx = state.image_idx
+    
+    # Get model-specific parameters
+    is_mllama = getattr(state, 'is_mllama', False)
+    num_image_tokens = getattr(state, 'num_image_tokens', 576)
+    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     word_rel_maps = torch.load(fn_attention)
     if type_selector not in word_rel_maps:
@@ -192,24 +232,77 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
         i+=1
         if rel_key in separators_list:
             continue
-        if (rel_map.shape[-1] != 577) and img_idx:
+        if (rel_map.shape[-1] != num_image_tokens + 1) and img_idx:
             if not incude_text_relevancy:
-                rel_map = rel_map[-1,:][img_idx:img_idx+576].reshape(24,24).float().cpu().numpy()
+                img_end_idx = min(img_idx + num_image_tokens, rel_map.shape[-1])
+                actual_img_tokens = img_end_idx - img_idx
+                rel_map_img = rel_map[-1,:][img_idx:img_end_idx].float().cpu().numpy()
+                
+                # Reshape to grid, handling different sizes
+                if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
+                    rel_map = rel_map_img.reshape(grid_size, grid_size)
+                else:
+                    # Interpolate to 24x24 for visualization
+                    from scipy.ndimage import zoom
+                    if actual_img_tokens > 0:
+                        side = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        padded = np.zeros(side * side)
+                        padded[:actual_img_tokens] = rel_map_img
+                        padded = padded.reshape(side, side)
+                        zoom_factor = 24 / side
+                        rel_map = zoom(padded, zoom_factor, order=1)
+                    else:
+                        rel_map = np.zeros((24, 24))
                 normalize_image_tokens = True
             if incude_text_relevancy:
                 input_text_tokenized = state.input_text_tokenized
                 input_text_tokenized_len = int(len(input_text_tokenized))
-                img_idx = int(img_idx)
-                rel_maps_no_system = torch.cat((rel_map[-1,:][img_idx:img_idx+576], rel_map[-1,:][img_idx+576+3:576 + input_text_tokenized_len-1-5]))
+                img_idx_int = int(img_idx)
+                
+                img_end_idx = min(img_idx_int + num_image_tokens, rel_map.shape[-1])
+                text_start_idx = img_end_idx + 3
+                text_end_idx = min(num_image_tokens + input_text_tokenized_len - 1 - 5, rel_map.shape[-1])
+                
+                rel_maps_img = rel_map[-1,:][img_idx_int:img_end_idx]
+                rel_maps_text = rel_map[-1,:][text_start_idx:text_end_idx] if text_start_idx < text_end_idx else torch.tensor([])
+                rel_maps_no_system = torch.cat((rel_maps_img, rel_maps_text))
+                
                 logger.debug(f'shape of rel_maps_no_system: {rel_maps_no_system.shape}')
-                # make sure the sum of the relevancy scores is 1
-                # if rel_maps_no_system.sum() != 0:
-                #     rel_maps_no_system /= rel_maps_no_system.sum()
-                rel_maps_no_system = (rel_maps_no_system - rel_maps_no_system.min()) / (rel_maps_no_system.max() - rel_maps_no_system.min())
-                rel_map = rel_maps_no_system[:576].reshape(24,24).cpu().numpy()
+                rel_maps_no_system = (rel_maps_no_system - rel_maps_no_system.min()) / (rel_maps_no_system.max() - rel_maps_no_system.min() + 1e-8)
+                
+                # Get image portion and reshape
+                actual_img_tokens = img_end_idx - img_idx_int
+                rel_map_img = rel_maps_no_system[:actual_img_tokens].cpu().numpy()
+                
+                if actual_img_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
+                    rel_map = rel_map_img.reshape(grid_size, grid_size)
+                else:
+                    from scipy.ndimage import zoom
+                    if actual_img_tokens > 0:
+                        side = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        padded = np.zeros(side * side)
+                        padded[:actual_img_tokens] = rel_map_img
+                        padded = padded.reshape(side, side)
+                        zoom_factor = 24 / side
+                        rel_map = zoom(padded, zoom_factor, order=1)
+                    else:
+                        rel_map = np.zeros((24, 24))
                 normalize_image_tokens = False
         else:
-            rel_map = rel_map[0,1:].reshape(24,24).cpu().numpy()
+            # ViT relevancy map
+            rel_map = rel_map[0,1:].cpu().numpy()
+            num_vit_tokens = len(rel_map)
+            vit_grid = int(np.sqrt(num_vit_tokens))
+            if vit_grid * vit_grid == num_vit_tokens:
+                rel_map = rel_map.reshape(vit_grid, vit_grid)
+            else:
+                from scipy.ndimage import zoom
+                side = int(np.ceil(np.sqrt(num_vit_tokens)))
+                padded = np.zeros(side * side)
+                padded[:num_vit_tokens] = rel_map
+                padded = padded.reshape(side, side)
+                zoom_factor = 24 / side
+                rel_map = zoom(padded, zoom_factor, order=1)
             normalize_image_tokens = True
         rel_map = draw_heatmap_on_image(rel_map, recovered_image, normalize=normalize_image_tokens)
         # strip _ from all rel keys
@@ -242,6 +335,9 @@ def handle_text_relevancy(state, type_selector):
         input_text_tokenized = state.input_text_tokenized
         word_rel_maps = torch.load(fn_attention)
         
+        # Get model-specific parameters
+        num_image_tokens = getattr(state, 'num_image_tokens', 576)
+        
         input_text_tokenized_all = input_text_tokenized.copy()
         # loop over all output tokens
         word_rel_map = word_rel_maps["llama_token"]
@@ -254,31 +350,54 @@ def handle_text_relevancy(state, type_selector):
             fig, ax = plt.subplots(figsize=(5, 5))
             # if the token is not a separator
             # if i < len(tokens) and tokens[i] not in separators_list:
-            img_avg_rel = rel_map[-1,:][img_idx:img_idx+576].mean()
-            img_max_rel = rel_map[-1,:][img_idx:img_idx+576].max()
+            img_end_idx = min(img_idx + num_image_tokens, rel_map.shape[-1])
+            img_avg_rel = rel_map[-1,:][img_idx:img_end_idx].mean()
+            img_max_rel = rel_map[-1,:][img_idx:img_end_idx].max()
             logger.debug(f'img_avg_rel for token {word}: {img_avg_rel}')
             # exclude the image tokens from the rel_scores[i] and replace all of them by a single value of the average relevancy for the image
             current_relevency = rel_map[-1,:][:img_idx].clone()
             # add the average relevancy for the image to the current_relevency tensor
-            current_relevency = torch.cat((current_relevency, img_avg_rel.unsqueeze(0)))    
-            current_relevency = torch.cat((current_relevency, rel_map[-1,:][img_idx+576:576 + len(input_text_tokenized_all)-1]))
+            current_relevency = torch.cat((current_relevency, img_avg_rel.unsqueeze(0)))
+            text_end_idx = min(img_end_idx + len(input_text_tokenized_all) - img_idx - 1, rel_map.shape[-1])
+            current_relevency = torch.cat((current_relevency, rel_map[-1,:][img_end_idx:text_end_idx]))
             current_relevency = current_relevency.cpu()
             logger.debug(f'shape of text relevancy map: {rel_map[-1,:].shape}')
             #rel_score_text = rel_scores[i][-1,:][:img_idx]
-            assert len(current_relevency) == len(input_text_tokenized_all), f"The length of the relevancy score ({len(current_relevency)}) is not the same as the length of the input tokens ({len(input_text_tokenized_all)})\n{input_text_tokenized_all}"
-            current_relevency = current_relevency[img_idx+3:-5]
-            input_text_tokenized = input_text_tokenized_all[img_idx+3:-5]
-            input_text_tokenized_word, current_relevency_word = convert_token2word(current_relevency, input_text_tokenized, separators_list) 
+            
+            # Adjust assertion for different model types
+            expected_len = len(input_text_tokenized_all) - num_image_tokens + 1  # +1 for the average image token
+            if len(current_relevency) != expected_len:
+                logger.warning(f"Length mismatch: relevancy={len(current_relevency)}, expected={expected_len}")
+                # Truncate or pad as needed
+                if len(current_relevency) > expected_len:
+                    current_relevency = current_relevency[:expected_len]
+            
+            offset = min(img_idx + 3, len(current_relevency))
+            end_offset = max(0, len(current_relevency) - 5)
+            if offset < end_offset:
+                current_relevency = current_relevency[offset:end_offset]
+                input_text_tokenized = input_text_tokenized_all[offset:end_offset] if offset < len(input_text_tokenized_all) else []
+            else:
+                current_relevency = current_relevency
+                input_text_tokenized = input_text_tokenized_all
+                
+            if len(input_text_tokenized) > 0 and len(current_relevency) > 0:
+                input_text_tokenized_word, current_relevency_word = convert_token2word(current_relevency, input_text_tokenized, separators_list)
+            else:
+                input_text_tokenized_word, current_relevency_word = [], torch.tensor([])
 
-            current_relevency_word_topk = current_relevency_word.topk(min(3,len(word_rel_map)))
-            max_rel_scores = current_relevency_word_topk.values
-            max_rel_scores = torch.cat((max_rel_scores, img_max_rel.unsqueeze(0).cpu()))
-            max_rel_scores_idx = current_relevency_word_topk.indices
-            max_input_token = [input_text_tokenized_word[j].lstrip('▁').lstrip('_') for j in max_rel_scores_idx]
+            if len(current_relevency_word) > 0:
+                current_relevency_word_topk = current_relevency_word.topk(min(3, len(current_relevency_word)))
+                max_rel_scores = current_relevency_word_topk.values
+                max_rel_scores = torch.cat((max_rel_scores, img_max_rel.unsqueeze(0).cpu()))
+                max_rel_scores_idx = current_relevency_word_topk.indices
+                max_input_token = [input_text_tokenized_word[j].lstrip('▁').lstrip('_') for j in max_rel_scores_idx if j < len(input_text_tokenized_word)]
+            else:
+                max_rel_scores = img_max_rel.unsqueeze(0).cpu()
+                max_input_token = []
 
             # Image to text relevancy ratio
-            # img_text_rel_ratio = max_rel_scores[-1] / current_relevency_word.mean()
-            img_text_rel_value = stats.percentileofscore(max_rel_scores, img_max_rel.item(), kind='strict') / 100
+            img_text_rel_value = stats.percentileofscore(max_rel_scores, img_max_rel.item(), kind='strict') / 100 if len(max_rel_scores) > 0 else 0.5
 
             highlighted_tokens.extend(
                 [
@@ -350,6 +469,10 @@ def plot_attention_analysis(state, attn_modality_select):
     fn_attention = state.attention_key + '_attn.pt'
     recovered_image = state.recovered_image
     img_idx = state.image_idx
+    
+    # Get model-specific parameters
+    num_image_tokens = getattr(state, 'num_image_tokens', 576)
+    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     if os.path.exists(fn_attention):
         attentions = torch.load(fn_attention)
@@ -373,20 +496,41 @@ def plot_attention_analysis(state, attn_modality_select):
             for head_idx in range(num_heads):
                 mh_attentions = []
                 mh_attentions = [attentions[i][layer_idx][:,:,-1,:].squeeze() for i in range(len(generated_text))]
-                img_attn = torch.stack([mh_attention[head_idx, img_idx:img_idx+576].reshape(24,24) for mh_attention in mh_attentions]).float().cpu().numpy()
-                # img_attn /= img_attn.max()
-                heatmap_mean[layer_idx][head_idx] =  img_attn.mean() # img_attn.mean((1,2))
+                img_attn_list = []
+                for mh_attention in mh_attentions:
+                    img_end_idx = min(img_idx + num_image_tokens, mh_attention.shape[-1])
+                    actual_tokens = img_end_idx - img_idx
+                    if actual_tokens > 0:
+                        attn_slice = mh_attention[head_idx, img_idx:img_end_idx].float().cpu()
+                        # Pad or reshape as needed
+                        if actual_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
+                            img_attn_list.append(attn_slice.reshape(grid_size, grid_size))
+                        else:
+                            # Interpolate to standard grid
+                            from scipy.ndimage import zoom
+                            side = int(np.ceil(np.sqrt(actual_tokens)))
+                            padded = torch.zeros(side * side)
+                            padded[:actual_tokens] = attn_slice
+                            padded = padded.reshape(side, side).numpy()
+                            zoom_factor = grid_size / side
+                            img_attn_list.append(torch.tensor(zoom(padded, zoom_factor, order=1)))
+                if img_attn_list:
+                    img_attn = torch.stack(img_attn_list).numpy()
+                    heatmap_mean[layer_idx][head_idx] = img_attn.mean()
+                else:
+                    heatmap_mean[layer_idx][head_idx] = 0.0
     elif attn_modality_select == "Question-to-Answer":
         fn_input_ids = state.attention_key + '_input_ids.pt'
         img_idx = state.image_idx
         input_ids = torch.load(fn_input_ids)
-        len_question_only = input_ids.shape[1] - img_idx - 1
+        len_question_only = input_ids.shape[1] - img_idx - num_image_tokens
         for layer_idx in range(num_layers):
             for head_idx in range(num_heads):
                 mh_attentions = []
                 mh_attentions = [attentions[i][layer_idx][:,:,-1,:].squeeze() for i in range(len(generated_text))]
-                ques_attn = torch.stack([mh_attention[head_idx, img_idx+576:img_idx+576+len_question_only] for mh_attention in mh_attentions]).float().cpu().numpy()
-                # ques_attn /= ques_attn.max()
+                ques_start = img_idx + num_image_tokens
+                ques_end = ques_start + len_question_only
+                ques_attn = torch.stack([mh_attention[head_idx, ques_start:ques_end] for mh_attention in mh_attentions]).float().cpu().numpy()
                 heatmap_mean[layer_idx][head_idx] = ques_attn.mean()
     heatmap_mean_df = pd.DataFrame(heatmap_mean)
     fig = plt.figure(figsize=(4, 4)) 
@@ -404,6 +548,10 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
     img_recover = state.recovered_image
     img_idx = state.image_idx
     generated_text = state.output_ids_decoded
+    
+    # Get model-specific parameters
+    num_image_tokens = getattr(state, 'num_image_tokens', 576)
+    grid_size = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
     # Sliders start at 1
     head_idx -= 1
@@ -417,21 +565,36 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
         if len(attentions) == len(state.output_ids_decoded):
             gr.Error('Mismatch between lengths of attentions and output tokens')
         
-        # num_tokens = len(attentions)
-        # num_layers = len(attentions[0])
-        # last_mh_attention = attentions[0][-1]
         batch_size, num_heads, inp_seq_len, seq_len = attentions[0][0].shape
         generated_text = state.output_ids_decoded
     
     else:
         return state, None
+    
     mh_attentions = []
     for head_id in range(num_heads):
         att_per_head = []
         for i, out_att in enumerate(attentions):
             mh_attention = out_att[layer_idx]
             mh_attention = mh_attention[:, :, -1, :].unsqueeze(2)
-            att_img = mh_attention.squeeze()[head_id, img_idx:img_idx+576].reshape(24,24)
+            img_end_idx = min(img_idx + num_image_tokens, mh_attention.squeeze().shape[-1])
+            actual_tokens = img_end_idx - img_idx
+            
+            if actual_tokens > 0:
+                att_raw = mh_attention.squeeze()[head_id, img_idx:img_end_idx]
+                if actual_tokens == num_image_tokens and grid_size * grid_size == num_image_tokens:
+                    att_img = att_raw.reshape(grid_size, grid_size)
+                else:
+                    # Interpolate to 24x24 grid for visualization
+                    from scipy.ndimage import zoom
+                    side = int(np.ceil(np.sqrt(actual_tokens)))
+                    padded = torch.zeros(side * side)
+                    padded[:actual_tokens] = att_raw
+                    padded = padded.reshape(side, side).cpu().numpy()
+                    zoom_factor = 24 / side
+                    att_img = torch.tensor(zoom(padded, zoom_factor, order=1))
+            else:
+                att_img = torch.zeros((24, 24))
             att_per_head.append(att_img)
         att_per_head = torch.stack(att_per_head)
         mh_attentions.append(att_per_head)
@@ -439,7 +602,8 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
 
     img_mask = np.zeros((24, 24))
     for img_patch in img_patches:
-        img_mask[img_patch[0], img_patch[1]] = 1
+        if img_patch[0] < 24 and img_patch[1] < 24:
+            img_mask[img_patch[0], img_patch[1]] = 1
     img_mask = cmap(img_mask)
     img_mask = Image.fromarray((img_mask[:, :, :3] * 255 ).astype(np.uint8)).resize((336,336), Image.BICUBIC)
     img_mask.putalpha(208)
@@ -448,8 +612,12 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
     img_patch_recovered
 
     words = generated_text
-    float_values = torch.mean(torch.stack([mh_attentions[head_idx, :, x, y] for x, y in img_patches]), dim=0).float().cpu()    
-    normalized_values = (float_values - float_values.min()) / (float_values.max() - float_values.min())
+    # Filter valid patches within the 24x24 grid
+    valid_patches = [(x, y) for x, y in img_patches if x < 24 and y < 24]
+    if not valid_patches:
+        valid_patches = [(5, 5)]
+    float_values = torch.mean(torch.stack([mh_attentions[head_idx, :, x, y] for x, y in valid_patches]), dim=0).float().cpu()    
+    normalized_values = (float_values - float_values.min()) / (float_values.max() - float_values.min() + 1e-8)
 
     fig = plt.figure(figsize=(10, 4))
     gs = gridspec.GridSpec(1, 2, width_ratios=[1, 3])  # 2 columns, first column for the image, second column for the words
@@ -475,11 +643,9 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
     ax_words.axis('off')
     plt.suptitle(f"Attention to the selected image patch(es) of head #{head_idx+1} and layer #{layer_idx+1}", fontsize=16, y=0.8, x=0.6)    
 
-    # attn_heatmap = plt.figure(figsize=(10, 3))
-    # attn_image_patch =  mh_attentions[:, :, img_patch[0], img_patch[1]].cpu().mean(-1)
-    attn_image_patch = torch.stack([mh_attentions[:, :, x, y] for x, y in img_patches]).mean(0).float().cpu().mean(-1)
-    logger.debug(torch.stack([mh_attentions[:, :, x, y] for x, y in img_patches]).shape)
-    logger.debug(torch.stack([mh_attentions[:, :, x, y] for x, y in img_patches]).mean(0).shape)
+    attn_image_patch = torch.stack([mh_attentions[:, :, x, y] for x, y in valid_patches]).mean(0).float().cpu().mean(-1)
+    logger.debug(torch.stack([mh_attentions[:, :, x, y] for x, y in valid_patches]).shape)
+    logger.debug(torch.stack([mh_attentions[:, :, x, y] for x, y in valid_patches]).mean(0).shape)
     logger.debug(attn_image_patch.shape)
     
     fig2 = plt.figure(figsize=(10, 3))

@@ -11,6 +11,8 @@ import spaces
 
 from torchvision.transforms.functional import to_pil_image
 
+from PIL import Image as PILImage
+
 from utils_model import get_processor_model, move_to_device, to_gradio_chatbot, process_image
 
 from utils_attn import (
@@ -26,10 +28,14 @@ from utils_causal_discovery import (
 
 logger = logging.getLogger(__name__)
 
-N_LAYERS = 32 
+N_LAYERS = 40  # Default for Llama 3.2 11B Vision (can be overridden)
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 ROLE0 = "USER"
 ROLE1 = "ASSISTANT"
+
+# Image token constants for different model types
+LLAVA_IMAGE_TOKEN = "<image>"
+MLLAMA_IMAGE_TOKEN = "<|image|>"
 
 processor = None
 model = None
@@ -70,28 +76,43 @@ def clear_history(request: gr.Request):
 
 def add_text(state, text, image, image_process_mode):
     global processor
-    
-    if True: # state is None:
+    global model
+
+    # (You currently always reset state; keeping your behavior)
+    if True:  # state is None:
         state = gr.State()
         state.messages = []
-        
+
+    # Handle ImageEditor dict and blank canvas
     if isinstance(image, dict):
-        image = image['composite']
-        background = Image.new('RGBA', image.size, (255, 255, 255))
-        image = Image.alpha_composite(background, image).convert('RGB')
+        image = image.get("composite", None)
+        if image is not None:
+            background = Image.new("RGBA", image.size, (255, 255, 255))
+            image = Image.alpha_composite(background, image).convert("RGB")
 
-        # ImageEditor does not return None image
-        if (np.array(image)==255).all():
-            image =None
+            # ImageEditor does not return None image; treat pure white as "no image"
+            if (np.array(image) == 255).all():
+                image = None
 
-    text = text[:1536]  # Hard cut-off
+    # Safely trim text
+    text = (text or "")[:1536]  # Hard cut-off
     logger.info(text)
 
     prompt_len = 0
-    # prompt=f"[INST] {system_prompt} [/INST]\n\n" if system_prompt else ""
+
+    # Determine image token based on model type
+    is_mllama = getattr(model, 'is_mllama', False) if model is not None else False
+    image_token = MLLAMA_IMAGE_TOKEN if is_mllama else LLAVA_IMAGE_TOKEN
+
+    # Build prompt depending on whether chat_template exists and whether we have an image
     if processor.tokenizer.chat_template is not None:
+        if image is not None:
+            user_content = f"{image_token}\n" + text
+        else:
+            user_content = text
+
         prompt = processor.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "<image>\n" + text}],
+            [{"role": "user", "content": user_content}],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -99,38 +120,89 @@ def add_text(state, text, image, image_process_mode):
     else:
         prompt = system_prompt
         prompt_len += len(prompt)
+
         if image is not None:
-            msg = f"\n{ROLE0}: <image>\n{text}\n{ROLE1}:" # Ignore <image> token when calculating prompt length\     
+            msg = f"\n{ROLE0}: {image_token}\n{text}\n{ROLE1}:"
         else:
             msg = f"\n{ROLE0}: {text}\n{ROLE1}: "
         prompt += msg
         prompt_len += len(msg)
 
-    state.messages.append([ROLE0,  (text, image, image_process_mode)])
+    # Store message for UI / history
+    if image is not None:
+        # Keep tuple only when we actually have an image
+        state.messages.append([ROLE0, (text, image, image_process_mode)])
+    else:
+        # Text-only turn
+        state.messages.append([ROLE0, text])
+
+    # Placeholder assistant message to be filled by lvlm_bot
     state.messages.append([ROLE1, None])
 
     state.prompt_len = prompt_len
     state.prompt = prompt
-    state.image = process_image(image, image_process_mode, return_pil=True)
+
+    # This is what lvlm_bot will use:
+    if image is not None:
+        state.image = process_image(image, image_process_mode, return_pil=True)
+    else:
+        state.image = None
 
     return (state, to_gradio_chatbot(state), "", None)
 
 
 @spaces.GPU
-def lvlm_bot(state, temperature, top_p, max_new_tokens):   
+def lvlm_bot(state, temperature, top_p, max_new_tokens):
     prompt = state.prompt
-    prompt_len = state.prompt_len
     image = state.image
+
+    is_mllama = getattr(model, 'is_mllama', False)
+
+    # 🔒 Only pass images if we really have a PIL image
+    if isinstance(image, PILImage.Image):
+        inputs = processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt",
+        ).to(model.device)
+    else:
+        # Text-only case: do NOT pass images at all
+        inputs = processor(
+            text=prompt,
+            return_tensors="pt",
+        ).to(model.device)
     
-    inputs = processor(prompt, image, return_tensors="pt").to(model.device)
     input_ids = inputs.input_ids
-    img_idx = torch.where(input_ids==model.config.image_token_index)[1][0].item()
+    
+    # Find image token index - different for Mllama vs LLaVA
+    if is_mllama:
+        # Mllama uses <|image|> token (id 128256 typically)
+        # The image token index in config may be different
+        image_token_id = getattr(model.config, 'image_token_index', 128256)
+        img_idx_matches = torch.where(input_ids == image_token_id)[1]
+        if len(img_idx_matches) > 0:
+            img_idx = img_idx_matches[0].item()
+        else:
+            # Fallback: look for the image token by searching common IDs
+            logger.warning("Could not find image token in input_ids for Mllama model")
+            img_idx = 0
+        # For Mllama, the number of image tokens depends on image size and tiling
+        # Typically it's much smaller than LLaVA's 576 patches
+        num_image_tokens = 1  # Mllama uses cross-attention, so only placeholder token in input_ids
+    else:
+        img_idx = torch.where(input_ids == model.config.image_token_index)[1][0].item()
+        num_image_tokens = 576  # LLaVA uses 576 image patches (24x24)
+    
     do_sample = True if temperature > 0.001 else False
     # Generate
     model.enc_attn_weights = []
     model.enc_attn_weights_vit = []
 
-    if model.language_model.config.model_type == "gemma":
+    # Determine EOS token
+    if is_mllama:
+        # Mllama typically uses <|eot_id|> as the end of turn token
+        eos_token_id = processor.tokenizer.eos_token_id
+    elif model.language_model.config.model_type == "gemma":
         eos_token_id = processor.tokenizer('<end_of_turn>', add_special_tokens=False).input_ids[0]
     else:
         eos_token_id = processor.tokenizer.eos_token_id
@@ -151,10 +223,16 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     input_ids_list = input_ids.reshape(-1).tolist()
     input_ids_list[img_idx] = 0
     input_text = processor.tokenizer.decode(input_ids_list) # eg. "<s> You are a helpful ..."
+    
+    # Handle different BOS tokens
     if input_text.startswith("<s> "):
         input_text = '<s>' + input_text[4:] # Remove the first space after <s> to maintain correct length
+    elif input_text.startswith("<|begin_of_text|> "):
+        input_text = '<|begin_of_text|>' + input_text[len('<|begin_of_text|> '):]
+        
     input_text_tokenized = processor.tokenizer.tokenize(input_text) # eg. ['<s>', '▁You', '▁are', '▁a', '▁helpful', ... ]
-    input_text_tokenized[img_idx] = "average_image"
+    if img_idx < len(input_text_tokenized):
+        input_text_tokenized[img_idx] = "average_image"
     
     output_ids = outputs.sequences.reshape(-1)[input_ids.shape[-1]:].tolist()  
 
@@ -166,7 +244,13 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     logger.debug(f"output_ids_decoded: {output_ids_decoded}")
     logger.debug(f"generated_text_tokenized: {generated_text_tokenized}")
 
-    state.messages[-1][-1] = generated_text[:-len('</s>')] if generated_text.endswith('</s>') else generated_text
+    # Clean up end tokens from display
+    end_tokens = ['</s>', '<|eot_id|>', '<|end_of_text|>']
+    cleaned_text = generated_text
+    for end_token in end_tokens:
+        if cleaned_text.endswith(end_token):
+            cleaned_text = cleaned_text[:-len(end_token)]
+    state.messages[-1][-1] = cleaned_text
 
     tempdir = os.getenv('TMPDIR', '/tmp/')
     tempfilename = tempfile.NamedTemporaryFile(dir=tempdir)
@@ -198,10 +282,21 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     # enc_attn_weights_vit = []
     # rel_maps = []
 
-    # Reconstruct processed image
+    # Reconstruct processed image - handle different pixel_values formats
     img_std = torch.tensor(processor.image_processor.image_std).view(3,1,1)
     img_mean = torch.tensor(processor.image_processor.image_mean).view(3,1,1)
-    img_recover = inputs.pixel_values[0].cpu() * img_std + img_mean
+    
+    pixel_values = inputs.pixel_values
+    # Mllama may have different pixel_values shape (e.g., with aspect ratio bins)
+    if is_mllama and pixel_values.dim() > 4:
+        # Take the first tile/aspect ratio
+        pixel_values = pixel_values[0, 0]
+    elif pixel_values.dim() == 4:
+        pixel_values = pixel_values[0]
+    else:
+        pixel_values = pixel_values[0]
+    
+    img_recover = pixel_values.cpu() * img_std + img_mean
     img_recover = to_pil_image(img_recover)
 
     state.recovered_image = img_recover
@@ -209,6 +304,8 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     state.output_ids_decoded = output_ids_decoded 
     state.attention_key = tempfilename.name
     state.image_idx = img_idx
+    state.is_mllama = is_mllama
+    state.num_image_tokens = num_image_tokens
 
     return state, to_gradio_chatbot(state) 
 
@@ -219,17 +316,34 @@ def build_demo(args, embed_mode=False):
     global system_prompt
     global ROLE0
     global ROLE1
+    global N_LAYERS
 
     if model is None:
         processor, model = get_processor_model(args)
 
-    if 'gemma' in args.model_name_or_path:
+    # Set model-specific configurations
+    is_mllama = getattr(model, 'is_mllama', False)
+    
+    if is_mllama:
+        # Llama 3.2 Vision has 40 layers for 11B model
+        N_LAYERS = len(model.language_model.layers)
+        system_prompt = ''  # Mllama uses chat template
+        ROLE0 = 'user'
+        ROLE1 = 'assistant'
+    elif 'gemma' in args.model_name_or_path:
         system_prompt = ''
         ROLE0 = 'user'
         ROLE1 = 'model'
+        # Get number of layers from model
+        language_model_layers = getattr(model.language_model, 'model', model.language_model).layers
+        N_LAYERS = len(language_model_layers)
+    else:
+        # Get number of layers from model
+        language_model_layers = getattr(model.language_model, 'model', model.language_model).layers
+        N_LAYERS = len(language_model_layers)
 
     textbox = gr.Textbox(show_label=False, placeholder="Enter text and press ENTER", container=False)
-    with gr.Blocks(title="LVLM-Interpret", theme=gr.themes.Default(), css=block_css) as demo:
+    with gr.Blocks(title="LVLM-Interpret") as demo:
         state = gr.State()
 
         if not embed_mode:
@@ -254,7 +368,12 @@ def build_demo(args, embed_mode=False):
 
 
                 with gr.Column(scale=6):
-                    chatbot = gr.Chatbot(elem_id="chatbot", label="Chatbot", height=400)
+                    chatbot = gr.Chatbot(
+                                    elem_id="chatbot",
+                                    label="Chatbot",
+                                    height=400,
+                                    sanitize_html=False,
+                                )
                     with gr.Row():
                         with gr.Column(scale=8):
                             textbox.render()
@@ -534,4 +653,3 @@ def build_demo(args, embed_mode=False):
         
 
     return demo
-
