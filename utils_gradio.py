@@ -36,7 +36,6 @@ ROLE1 = "ASSISTANT"
 # Image token constants for different model types
 LLAVA_IMAGE_TOKEN = "<image>"
 MLLAMA_IMAGE_TOKEN = "<|image|>"
-QWEN_VL_IMAGE_TOKEN = "<|image_pad|>"  # Qwen VL uses <|image_pad|> as placeholder, but we use <|vision_start|>...<|vision_end|> in prompt
 
 processor = None
 model = None
@@ -103,12 +102,8 @@ def add_text(state, text, image, image_process_mode):
 
     # Determine image token based on model type
     is_mllama = getattr(model, 'is_mllama', False) if model is not None else False
-    is_qwen_vl = getattr(model, 'is_qwen_vl', False) if model is not None else False
     
-    if is_qwen_vl:
-        # Qwen VL uses a special format with vision tags - processor handles image insertion
-        image_token = ""  # Will be handled by processor
-    elif is_mllama:
+    if is_mllama:
         image_token = MLLAMA_IMAGE_TOKEN
     else:
         image_token = LLAVA_IMAGE_TOKEN
@@ -116,20 +111,14 @@ def add_text(state, text, image, image_process_mode):
     # Build prompt depending on whether chat_template exists and whether we have an image
     if processor.tokenizer.chat_template is not None:
         if image is not None:
-            if is_qwen_vl:
-                # For Qwen VL, use special content format that processor understands
-                # The processor expects a list of content items for multimodal input
-                user_content = [
-                    {"type": "image"},
-                    {"type": "text", "text": text}
-                ]
-                # Use processor's apply_chat_template which handles the image placeholder
-                prompt = processor.apply_chat_template(
-                    [{"role": "user", "content": user_content}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+            # For vision models, use multi-modal content format if processor supports it
+            # Otherwise fall back to string format with image token
+            if hasattr(processor, 'apply_chat_template'):
+                # Modern processor with vision support - use content list format
+                conversation = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
+                prompt = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
             else:
+                # Legacy format with image token string
                 user_content = f"{image_token}\n" + text
                 prompt = processor.tokenizer.apply_chat_template(
                     [{"role": "user", "content": user_content}],
@@ -172,9 +161,7 @@ def add_text(state, text, image, image_process_mode):
     # This is what lvlm_bot will use:
     if image is not None:
         is_mllama_local = getattr(model, 'is_mllama', False) if model is not None else False
-        is_qwen_vl_local = getattr(model, 'is_qwen_vl', False) if model is not None else False
-        # Both Mllama and Qwen VL use smaller image resolution handling
-        state.image = process_image(image, image_process_mode, return_pil=True, is_mllama=is_mllama_local or is_qwen_vl_local)
+        state.image = process_image(image, image_process_mode, return_pil=True, is_mllama=is_mllama_local)
     else:
         state.image = None
 
@@ -187,7 +174,6 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     image = state.image
 
     is_mllama = getattr(model, 'is_mllama', False)
-    is_qwen_vl = getattr(model, 'is_qwen_vl', False)
 
     # 🔒 Only pass images if we really have a PIL image
     if isinstance(image, PILImage.Image):
@@ -206,53 +192,7 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     input_ids = inputs.input_ids
     
     # Find image token index - different for each model type
-    # Initialize grid dimensions (will be set for Qwen VL)
-    image_grid_hw = None
-    
-    if is_qwen_vl:
-        # Qwen VL uses image_token_id from config (typically 151655)
-        # The image tokens are embedded inline in the sequence
-        image_token_id = getattr(model.config, 'image_token_id', 151655)
-        img_idx_matches = torch.where(input_ids == image_token_id)[1]
-        if len(img_idx_matches) > 0:
-            img_idx = img_idx_matches[0].item()
-            # Count how many image tokens there are (for Qwen VL, this varies based on image size)
-            num_image_tokens = len(img_idx_matches)
-            logger.info(f"Qwen VL: Found {num_image_tokens} image tokens starting at index {img_idx}")
-        else:
-            # Try alternative: look for vision_start token
-            vision_start_id = getattr(model.config, 'vision_start_token_id', None)
-            if vision_start_id is not None:
-                start_matches = torch.where(input_ids == vision_start_id)[1]
-                if len(start_matches) > 0:
-                    img_idx = start_matches[0].item() + 1  # +1 to skip the vision_start token itself
-                else:
-                    logger.warning("Could not find vision tokens in input_ids for Qwen VL model")
-                    img_idx = 0
-            else:
-                logger.warning("Could not find image token in input_ids for Qwen VL model")
-                img_idx = 0
-            # Default number of image tokens - will be recalculated based on actual input
-            num_image_tokens = 256  # Typical for Qwen VL with standard image size
-        
-        # Get actual grid dimensions from image_grid_thw (temporal, height, width)
-        # NOTE: image_grid_thw gives dimensions BEFORE spatial merge (2x2 pooling)
-        # The actual number of image tokens is after the merge
-        if hasattr(inputs, 'image_grid_thw') and inputs.image_grid_thw is not None:
-            grid_thw = inputs.image_grid_thw[0]  # First image
-            raw_grid_h, raw_grid_w = grid_thw[1].item(), grid_thw[2].item()
-            
-            # Get spatial merge size from config (typically 2 for Qwen VL)
-            spatial_merge_size = getattr(model.config.vision_config, 'spatial_merge_size', 2)
-            
-            # Calculate actual grid dimensions after spatial merge
-            grid_h = raw_grid_h // spatial_merge_size
-            grid_w = raw_grid_w // spatial_merge_size
-            
-            image_grid_hw = (grid_h, grid_w)
-            num_image_tokens = grid_h * grid_w
-            logger.info(f"Qwen VL: Image grid is {grid_h}x{grid_w} = {num_image_tokens} tokens (after {spatial_merge_size}x{spatial_merge_size} merge)")
-    elif is_mllama:
+    if is_mllama:
         # Mllama uses <|image|> token (id 128256 typically)
         # The image token index in config may be different
         image_token_id = getattr(model.config, 'image_token_index', 128256)
@@ -267,8 +207,16 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
         # Typically it's much smaller than LLaVA's 576 patches
         num_image_tokens = 1  # Mllama uses cross-attention, so only placeholder token in input_ids
     else:
-        img_idx = torch.where(input_ids == model.config.image_token_index)[1][0].item()
-        num_image_tokens = 576  # LLaVA uses 576 image patches (24x24)
+        # LLaVA model
+        img_idx_matches = torch.where(input_ids == model.config.image_token_index)[1]
+        if len(img_idx_matches) > 0:
+            img_idx = img_idx_matches[0].item()
+            num_image_tokens = 576  # LLaVA uses 576 image patches (24x24)
+        else:
+            # Text-only query - no image token present
+            logger.warning("No image token found in input_ids for LLaVA model (text-only query)")
+            img_idx = 0
+            num_image_tokens = 0
     
     do_sample = True if temperature > 0.001 else False
     # Clear previous attention weights to free memory
@@ -280,10 +228,7 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     gc.collect()
 
     # Determine EOS token
-    if is_qwen_vl:
-        # Qwen VL uses <|im_end|> or <|endoftext|> as EOS
-        eos_token_id = processor.tokenizer.eos_token_id
-    elif is_mllama:
+    if is_mllama:
         # Mllama typically uses <|eot_id|> as the end of turn token
         eos_token_id = processor.tokenizer.eos_token_id
     elif hasattr(model, 'language_model') and hasattr(model.language_model, 'config') and model.language_model.config.model_type == "gemma":
@@ -309,14 +254,7 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
         )
 
     input_ids_list = input_ids.reshape(-1).tolist()
-    # For Qwen VL, we may have multiple image tokens - zero out all of them
-    if is_qwen_vl:
-        image_token_id = getattr(model.config, 'image_token_id', 151655)
-        for i, tid in enumerate(input_ids_list):
-            if tid == image_token_id:
-                input_ids_list[i] = 0
-    else:
-        input_ids_list[img_idx] = 0
+    input_ids_list[img_idx] = 0
     input_text = processor.tokenizer.decode(input_ids_list) # eg. "<s> You are a helpful ..."
     
     # Handle different BOS tokens
@@ -324,9 +262,6 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
         input_text = '<s>' + input_text[4:] # Remove the first space after <s> to maintain correct length
     elif input_text.startswith("<|begin_of_text|> "):
         input_text = '<|begin_of_text|>' + input_text[len('<|begin_of_text|> '):]
-    elif input_text.startswith("<|im_start|> "):
-        # Qwen VL uses <|im_start|> token
-        input_text = '<|im_start|>' + input_text[len('<|im_start|> '):]
         
     input_text_tokenized = processor.tokenizer.tokenize(input_text) # eg. ['<s>', '▁You', '▁are', '▁a', '▁helpful', ... ]
     if img_idx < len(input_text_tokenized):
@@ -381,44 +316,33 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     # rel_maps = []
 
     # Reconstruct processed image - handle different pixel_values formats
-    img_std = torch.tensor(processor.image_processor.image_std).view(3,1,1)
-    img_mean = torch.tensor(processor.image_processor.image_mean).view(3,1,1)
-    
-    pixel_values = inputs.pixel_values
-    # Handle different pixel_values shapes for different models
-    if is_qwen_vl:
-        # Qwen VL may have pixel_values with shape (batch, num_patches, channels, height, width)
-        # or (batch, channels, height, width)
-        if pixel_values.dim() == 5:
-            # Take first patch
+    if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
+        img_std = torch.tensor(processor.image_processor.image_std).view(3,1,1)
+        img_mean = torch.tensor(processor.image_processor.image_mean).view(3,1,1)
+        
+        pixel_values = inputs.pixel_values
+        # Handle different pixel_values shapes for different models
+        if is_mllama and pixel_values.dim() > 4:
+            # Mllama may have different pixel_values shape (e.g., with aspect ratio bins)
+            # Take the first tile/aspect ratio
             pixel_values = pixel_values[0, 0]
         elif pixel_values.dim() == 4:
             pixel_values = pixel_values[0]
         else:
             pixel_values = pixel_values[0]
-    elif is_mllama and pixel_values.dim() > 4:
-        # Mllama may have different pixel_values shape (e.g., with aspect ratio bins)
-        # Take the first tile/aspect ratio
-        pixel_values = pixel_values[0, 0]
-    elif pixel_values.dim() == 4:
-        pixel_values = pixel_values[0]
+        
+        img_recover = pixel_values.cpu() * img_std + img_mean
+        img_recover = to_pil_image(img_recover)
+        state.recovered_image = img_recover
     else:
-        pixel_values = pixel_values[0]
-    
-    img_recover = pixel_values.cpu() * img_std + img_mean
-    img_recover = to_pil_image(img_recover)
-
-    state.recovered_image = img_recover
+        # Text-only query - no image to recover
+        state.recovered_image = None
     state.input_text_tokenized = input_text_tokenized
     state.output_ids_decoded = output_ids_decoded 
     state.attention_key = tempfilename.name
     state.image_idx = img_idx
     state.is_mllama = is_mllama
-    state.is_qwen_vl = is_qwen_vl
     state.num_image_tokens = num_image_tokens
-    # For Qwen VL: store actual grid dimensions (height, width) for proper aspect ratio
-    # This is None for LLaVA (which uses fixed 24x24) and Mllama
-    state.image_grid_hw = image_grid_hw
 
     return state, to_gradio_chatbot(state) 
 
@@ -436,21 +360,8 @@ def build_demo(args, embed_mode=False):
 
     # Set model-specific configurations
     is_mllama = getattr(model, 'is_mllama', False)
-    is_qwen_vl = getattr(model, 'is_qwen_vl', False)
     
-    if is_qwen_vl:
-        # Qwen VL models: language model is accessed through model.model.language_model.layers
-        if hasattr(model, 'model') and hasattr(model.model, 'language_model'):
-            N_LAYERS = len(model.model.language_model.layers)
-        elif hasattr(model, 'language_model'):
-            N_LAYERS = len(model.language_model.layers)
-        else:
-            N_LAYERS = 28  # Default for Qwen3-VL-2B
-        system_prompt = ''  # Qwen VL uses chat template
-        ROLE0 = 'user'
-        ROLE1 = 'assistant'
-        logger.info(f"Qwen VL model detected with {N_LAYERS} layers")
-    elif is_mllama:
+    if is_mllama:
         # Llama 3.2 Vision has 40 layers for 11B model
         N_LAYERS = len(model.language_model.layers)
         system_prompt = ''  # Mllama uses chat template

@@ -165,20 +165,11 @@ def construct_relevancy_map(tokenizer, model, input_ids, tokens, outputs, output
     
     # Check model type
     is_mllama = getattr(model, 'is_mllama', False)
-    is_qwen_vl = getattr(model, 'is_qwen_vl', False)
     
     # Determine number of image tokens based on model type
     if is_mllama:
         # Mllama uses cross-attention, so only 1 placeholder token in input_ids
         num_image_tokens = 1
-    elif is_qwen_vl:
-        # Qwen VL: count actual image tokens in input_ids
-        image_token_id = getattr(model.config, 'image_token_id', 151655)
-        num_image_tokens = (input_ids == image_token_id).sum().item()
-        if num_image_tokens == 0:
-            # Fallback: estimate based on vision config
-            num_image_tokens = 256  # Default for Qwen VL with standard image
-        logger.debug(f'Qwen VL: Found {num_image_tokens} image tokens')
     else:
         num_image_tokens = 576  # LLaVA uses 24x24 = 576 image patches
     

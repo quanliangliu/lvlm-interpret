@@ -5,21 +5,11 @@ from PIL import Image
 import torch
 # from torchvision.transforms.functional import to_pil_image
 from transformers import LlavaForConditionalGeneration, MllamaForConditionalGeneration, AutoProcessor
-from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
-try:
-    from transformers import Qwen3VLForConditionalGeneration
-    QWEN3_VL_AVAILABLE = True
-except ImportError:
-    QWEN3_VL_AVAILABLE = False
 from transformers import BitsAndBytesConfig
 
 func_to_enable_grad = '_sample'
 setattr(LlavaForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(LlavaForConditionalGeneration, func_to_enable_grad)))
 setattr(MllamaForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(MllamaForConditionalGeneration, func_to_enable_grad)))
-setattr(Qwen2VLForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(Qwen2VLForConditionalGeneration, func_to_enable_grad)))
-setattr(Qwen2_5_VLForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(Qwen2_5_VLForConditionalGeneration, func_to_enable_grad)))
-if QWEN3_VL_AVAILABLE:
-    setattr(Qwen3VLForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(Qwen3VLForConditionalGeneration, func_to_enable_grad)))
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -32,22 +22,6 @@ def is_mllama_model(model_name_or_path):
     """Check if the model is a Llama 3.2 Vision (Mllama) model."""
     mllama_patterns = ["llama-3.2", "Llama-3.2", "mllama", "Mllama", "11B-Vision", "90B-Vision"]
     return any(pattern.lower() in model_name_or_path.lower() for pattern in mllama_patterns)
-
-def is_qwen_vl_model(model_name_or_path):
-    """Check if the model is a Qwen VL (Vision-Language) model."""
-    qwen_patterns = ["qwen2-vl", "qwen2.5-vl", "qwen3-vl", "Qwen2-VL", "Qwen2.5-VL", "Qwen3-VL"]
-    return any(pattern.lower() in model_name_or_path.lower() for pattern in qwen_patterns)
-
-def get_qwen_vl_version(model_name_or_path):
-    """Get the Qwen VL version (2, 2.5, or 3)."""
-    model_lower = model_name_or_path.lower()
-    if "qwen3-vl" in model_lower or "qwen3_vl" in model_lower:
-        return 3
-    elif "qwen2.5-vl" in model_lower or "qwen2_5-vl" in model_lower or "qwen2_5_vl" in model_lower:
-        return 2.5
-    elif "qwen2-vl" in model_lower or "qwen2_vl" in model_lower:
-        return 2
-    return None
 
 def get_processor_model(args):
     #outputs: attn_output, attn_weights, past_key_value
@@ -77,40 +51,8 @@ def get_processor_model(args):
 
     # Determine which model class to use based on model name
     use_mllama = is_mllama_model(args.model_name_or_path)
-    use_qwen_vl = is_qwen_vl_model(args.model_name_or_path)
-    qwen_version = get_qwen_vl_version(args.model_name_or_path) if use_qwen_vl else None
     
-    if use_qwen_vl:
-        logger.info(f"Loading Qwen{qwen_version}-VL model: {args.model_name_or_path}")
-        if qwen_version == 3:
-            if not QWEN3_VL_AVAILABLE:
-                raise ImportError("Qwen3VLForConditionalGeneration is not available. Please upgrade transformers.")
-            model = Qwen3VLForConditionalGeneration.from_pretrained(
-                args.model_name_or_path, torch_dtype=torch.bfloat16, 
-                quantization_config=quant_config, low_cpu_mem_usage=True, device_map=args.device_map,
-                attn_implementation='eager'
-            )
-        elif qwen_version == 2.5:
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                args.model_name_or_path, torch_dtype=torch.bfloat16, 
-                quantization_config=quant_config, low_cpu_mem_usage=True, device_map=args.device_map,
-                attn_implementation='eager'
-            )
-        else:  # qwen_version == 2
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
-                args.model_name_or_path, torch_dtype=torch.bfloat16, 
-                quantization_config=quant_config, low_cpu_mem_usage=True, device_map=args.device_map,
-                attn_implementation='eager'
-            )
-        # Store model type for later reference
-        model.is_mllama = False
-        model.is_qwen_vl = True
-        model.qwen_vl_version = qwen_version
-        # Qwen VL uses model.visual for vision and model.model.language_model for text
-        # Enable output_attentions for vision model if available
-        if hasattr(model, 'visual') and hasattr(model.visual, 'config'):
-            model.visual.config.output_attentions = True
-    elif use_mllama:
+    if use_mllama:
         logger.info(f"Loading Llama 3.2 Vision (Mllama) model: {args.model_name_or_path}")
         model = MllamaForConditionalGeneration.from_pretrained(
             args.model_name_or_path, torch_dtype=torch.bfloat16, 
@@ -119,7 +61,6 @@ def get_processor_model(args):
         )
         # Store model type for later reference
         model.is_mllama = True
-        model.is_qwen_vl = False
         # Mllama uses a different vision model structure
         model.vision_model.config.output_attentions = True
         # Enable gradient checkpointing to reduce memory usage during forward pass
@@ -133,7 +74,6 @@ def get_processor_model(args):
             attn_implementation='eager'
         )
         model.is_mllama = False
-        model.is_qwen_vl = False
         model.vision_tower.config.output_attentions = True
 
     # Relevancy map
@@ -155,18 +95,7 @@ def get_processor_model(args):
 
     hooks_pre_encoder, hooks_encoder = [], []
     # Handle different model architectures (some have .model.layers, others have .layers directly)
-    
-    if use_qwen_vl:
-        # Qwen VL models: language model is accessed through model.model.language_model.layers
-        # or model.language_model.layers depending on the model structure
-        if hasattr(model, 'model') and hasattr(model.model, 'language_model'):
-            language_model_layers = model.model.language_model.layers
-        elif hasattr(model, 'language_model'):
-            language_model_layers = model.language_model.layers
-        else:
-            raise AttributeError("Could not find language model layers for Qwen VL model")
-    else:
-        language_model_layers = getattr(model.language_model, 'model', model.language_model).layers
+    language_model_layers = getattr(model.language_model, 'model', model.language_model).layers
     
     for layer in language_model_layers:
         # Mllama has both self-attention and cross-attention layers
@@ -197,27 +126,7 @@ def get_processor_model(args):
         return output
 
     hooks_pre_encoder_vit = []
-    if use_qwen_vl:
-        # Qwen VL models: vision model is accessed through model.visual.blocks
-        # Each block has an 'attn' attribute for vision attention
-        try:
-            if hasattr(model, 'visual') and hasattr(model.visual, 'blocks'):
-                vision_blocks = model.visual.blocks
-                for block in vision_blocks:
-                    if hasattr(block, 'attn'):
-                        hook_encoder_layer_vit = block.attn.register_forward_hook(forward_hook_image_processor)
-                        hooks_pre_encoder_vit.append(hook_encoder_layer_vit)
-            elif hasattr(model, 'model') and hasattr(model.model, 'visual') and hasattr(model.model.visual, 'blocks'):
-                vision_blocks = model.model.visual.blocks
-                for block in vision_blocks:
-                    if hasattr(block, 'attn'):
-                        hook_encoder_layer_vit = block.attn.register_forward_hook(forward_hook_image_processor)
-                        hooks_pre_encoder_vit.append(hook_encoder_layer_vit)
-            else:
-                logger.warning("Could not find vision blocks for Qwen VL model. Vision attention hooks not set.")
-        except Exception as e:
-            logger.warning(f"Could not set up vision hooks for Qwen VL: {e}")
-    elif use_mllama:
+    if use_mllama:
         # Mllama has a different vision model structure
         # The vision encoder is accessed through model.vision_model
         try:

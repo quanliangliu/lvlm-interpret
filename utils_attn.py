@@ -77,27 +77,27 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
     '''
         Draw attention heatmaps and return as a list of PIL images
     '''
+    logger.info(f"handle_attentions_i2t called with layer_idx={layer_idx}")
 
     if not hasattr(state, 'attention_key'):
+        logger.warning("No attention_key found in state")
         return None, None, [], None
+    
+    recovered_image = getattr(state, 'recovered_image', None)
+    if recovered_image is None:
+        logger.warning("No recovered_image found - cannot plot attention heatmaps")
+        return None, None, [], None
+        
     layer_idx -= 1 
     fn_attention = state.attention_key + '_attn.pt'
-    recovered_image = state.recovered_image
     img_idx = state.image_idx
     
     # Get model-specific parameters
     is_mllama = getattr(state, 'is_mllama', False)
-    is_qwen_vl = getattr(state, 'is_qwen_vl', False)
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
-    image_grid_hw = getattr(state, 'image_grid_hw', None)
     
     # Calculate grid dimensions for visualization
-    if image_grid_hw is not None:
-        # Qwen VL with dynamic resolution - use actual grid dimensions
-        grid_h, grid_w = image_grid_hw
-        logger.debug(f"Using Qwen VL grid dimensions: {grid_h}x{grid_w}")
-    elif num_image_tokens == 576:
+    if num_image_tokens == 576:
         grid_h, grid_w = 24, 24
     else:
         # For Mllama or other models - try to infer square grid
@@ -140,85 +140,88 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
         
 
     if not os.path.exists(fn_attention):
+        logger.error(f'Attention file not found: {fn_attention}')
         gr.Error('Attention file not found. Please re-run query.')
-    else:
-        attentions = torch.load(fn_attention)
-        logger.info(f'Loaded attention from {fn_attention}')
-        if len(attentions) == len(state.output_ids_decoded):
-            gr.Error('Mismatch between lengths of attentions and output tokens')
-        batch_size, num_heads, inp_seq_len, seq_len = attentions[0][0].shape
-        cmap = plt.get_cmap('jet')
+        return None, None, [], None
+    
+    logger.info(f'Loading attention from {fn_attention}...')
+    attentions = torch.load(fn_attention)
+    logger.info(f'Loaded attention with {len(attentions)} tokens')
+    
+    if len(attentions) == len(state.output_ids_decoded):
+        gr.Error('Mismatch between lengths of attentions and output tokens')
+    batch_size, num_heads, inp_seq_len, seq_len = attentions[0][0].shape
+    logger.info(f'Processing {num_heads} heads, {len(token_idx_list)} selected tokens')
+    cmap = plt.get_cmap('jet')
 
-        img_attn_list = []
-        img_attn_mean = []
-        for head_idx in range(num_heads):
-            img_attn = None
-            for token_idx in token_idx_list:
-                if token_idx >= len(attentions):
-                    logger.info(f'token index {token_idx} out of bounds')
-                    continue
-                mh_attention = attentions[token_idx][layer_idx]
-                batch_size, num_heads, inp_seq_len, seq_len = mh_attention.shape
-                if inp_seq_len > 1:
-                    mh_attention = mh_attention[:,:,-1,:]
-                mh_attention = mh_attention.squeeze()
+    img_attn_list = []
+    img_attn_mean = []
+    for head_idx in range(num_heads):
+        img_attn = None
+        for token_idx in token_idx_list:
+            if token_idx >= len(attentions):
+                logger.info(f'token index {token_idx} out of bounds')
+                continue
+            mh_attention = attentions[token_idx][layer_idx]
+            batch_size, num_heads, inp_seq_len, seq_len = mh_attention.shape
+            if inp_seq_len > 1:
+                mh_attention = mh_attention[:,:,-1,:]
+            mh_attention = mh_attention.squeeze()
+            
+            # Handle different image token counts
+            img_end_idx = min(img_idx + num_image_tokens, seq_len)
+            actual_img_tokens = img_end_idx - img_idx
+            
+            if actual_img_tokens > 0:
+                img_attn_raw = mh_attention[head_idx, img_idx:img_end_idx].float().cpu().numpy()
+                # Reshape to grid using actual dimensions
+                from scipy.ndimage import zoom
+                target_size = 24  # Standard output size for visualization
                 
-                # Handle different image token counts
-                img_end_idx = min(img_idx + num_image_tokens, seq_len)
-                actual_img_tokens = img_end_idx - img_idx
-                
-                if actual_img_tokens > 0:
-                    img_attn_raw = mh_attention[head_idx, img_idx:img_end_idx].float().cpu().numpy()
-                    # Reshape to grid using actual dimensions
-                    from scipy.ndimage import zoom
-                    target_size = 24  # Standard output size for visualization
-                    
-                    if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
-                        # Reshape to actual grid dimensions (may be non-square for Qwen VL)
-                        img_attn_grid = img_attn_raw.reshape(grid_h, grid_w)
-                        # Resize to target visualization size while preserving aspect ratio
-                        zoom_factors = (target_size / grid_h, target_size / grid_w)
-                        img_attn_token = zoom(img_attn_grid, zoom_factors, order=1)
-                    else:
-                        # Fallback: interpolate to standard visualization size
-                        img_attn_token = np.zeros((target_size, target_size))
-                        if actual_img_tokens > 0:
-                            # Try to infer grid dimensions
-                            if image_grid_hw is not None:
-                                inferred_h, inferred_w = image_grid_hw
-                            else:
-                                inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
-                            # Pad if needed
-                            padded = np.zeros(inferred_h * inferred_w)
-                            padded[:actual_img_tokens] = img_attn_raw
-                            padded = padded.reshape(inferred_h, inferred_w)
-                            zoom_factors = (target_size / inferred_h, target_size / inferred_w)
-                            img_attn_token = zoom(padded, zoom_factors, order=1)
+                if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
+                    # Reshape to actual grid dimensions
+                    img_attn_grid = img_attn_raw.reshape(grid_h, grid_w)
+                    # Resize to target visualization size
+                    zoom_factors = (target_size / grid_h, target_size / grid_w)
+                    img_attn_token = zoom(img_attn_grid, zoom_factors, order=1)
                 else:
-                    img_attn_token = np.zeros((24, 24))
+                    # Fallback: interpolate to standard visualization size
+                    img_attn_token = np.zeros((target_size, target_size))
+                    if actual_img_tokens > 0:
+                        # Try to infer grid dimensions
+                        inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        # Pad if needed
+                        padded = np.zeros(inferred_h * inferred_w)
+                        padded[:actual_img_tokens] = img_attn_raw
+                        padded = padded.reshape(inferred_h, inferred_w)
+                        zoom_factors = (target_size / inferred_h, target_size / inferred_w)
+                        img_attn_token = zoom(padded, zoom_factors, order=1)
+            else:
+                img_attn_token = np.zeros((24, 24))
 
-                if img_attn is None:
-                    img_attn = img_attn_token
-                else:
-                    img_attn += img_attn_token
-            img_attn /= len(token_idx_list)
-            img_overlay_attn = draw_heatmap_on_image(img_attn, recovered_image)
+            if img_attn is None:
+                img_attn = img_attn_token
+            else:
+                img_attn += img_attn_token
+        img_attn /= len(token_idx_list)
+        img_overlay_attn = draw_heatmap_on_image(img_attn, recovered_image)
 
-            img_attn_list.append((img_overlay_attn, f'Head_{head_idx}'))
+        img_attn_list.append((img_overlay_attn, f'Head_{head_idx}'))
 
-            # Calculate mean attention per head
-            img_attn /= (img_attn.max() + 1e-8)
-            img_attn_mean.append(img_attn.mean())
-        img_attn_list = [x for _, x in sorted(zip(img_attn_mean, img_attn_list), key=lambda pair: pair[0], reverse=True)]
+        # Calculate mean attention per head
+        img_attn /= (img_attn.max() + 1e-8)
+        img_attn_mean.append(img_attn.mean())
+    
+    img_attn_list = [x for _, x in sorted(zip(img_attn_mean, img_attn_list), key=lambda pair: pair[0], reverse=True)]
 
-        fig = plt.figure(figsize=(10, 3))
-        ax = seaborn.heatmap([img_attn_mean], 
-            linewidths=.3, square=True, cbar_kws={"orientation": "horizontal", "shrink":0.3}
-        )
-        ax.set_xlabel('Head number')
-        ax.set_title(f"Mean Attention between the image and the token {[state.output_ids_decoded[tok] for tok in token_idx_list]} for layer {layer_idx+1}")
+    fig = plt.figure(figsize=(10, 3))
+    ax = seaborn.heatmap([img_attn_mean], 
+        linewidths=.3, square=True, cbar_kws={"orientation": "horizontal", "shrink":0.3}
+    )
+    ax.set_xlabel('Head number')
+    ax.set_title(f"Mean Attention between the image and the token {[state.output_ids_decoded[tok] for tok in token_idx_list]} for layer {layer_idx+1}")
 
-        fig.tight_layout()
+    fig.tight_layout()
 
     return generated_text, recovered_image, img_attn_list, fig
 
@@ -235,16 +238,10 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
     
     # Get model-specific parameters
     is_mllama = getattr(state, 'is_mllama', False)
-    is_qwen_vl = getattr(state, 'is_qwen_vl', False)
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
-    image_grid_hw = getattr(state, 'image_grid_hw', None)
     
     # Calculate grid dimensions
-    if image_grid_hw is not None:
-        # Qwen VL with dynamic resolution - use actual grid dimensions
-        grid_h, grid_w = image_grid_hw
-    elif num_image_tokens == 576:
+    if num_image_tokens == 576:
         grid_h, grid_w = 24, 24
     else:
         grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
@@ -272,7 +269,7 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 target_size = 24  # Standard output size for visualization
                 
                 if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
-                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                    # Reshape to actual grid dimensions
                     rel_map_grid = rel_map_img.reshape(grid_h, grid_w)
                     # Resize to target visualization size
                     zoom_factors = (target_size / grid_h, target_size / grid_w)
@@ -280,10 +277,7 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 else:
                     # Fallback: interpolate to standard visualization size
                     if actual_img_tokens > 0:
-                        if image_grid_hw is not None:
-                            inferred_h, inferred_w = image_grid_hw
-                        else:
-                            inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
                         padded = np.zeros(inferred_h * inferred_w)
                         padded[:actual_img_tokens] = rel_map_img
                         padded = padded.reshape(inferred_h, inferred_w)
@@ -310,13 +304,13 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 
                 # Get image portion and reshape using actual grid dimensions
                 actual_img_tokens = img_end_idx - img_idx_int
-                rel_map_img = rel_maps_no_system[:actual_img_tokens].cpu().numpy()
+                rel_map_img = rel_maps_no_system[:actual_img_tokens].float().cpu().numpy()
                 
                 from scipy.ndimage import zoom
                 target_size = 24  # Standard output size for visualization
                 
                 if actual_img_tokens == num_image_tokens and actual_img_tokens == grid_h * grid_w:
-                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                    # Reshape to actual grid dimensions
                     rel_map_grid = rel_map_img.reshape(grid_h, grid_w)
                     # Resize to target visualization size
                     zoom_factors = (target_size / grid_h, target_size / grid_w)
@@ -324,10 +318,7 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 else:
                     # Fallback: interpolate to standard visualization size
                     if actual_img_tokens > 0:
-                        if image_grid_hw is not None:
-                            inferred_h, inferred_w = image_grid_hw
-                        else:
-                            inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
+                        inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_img_tokens)))
                         padded = np.zeros(inferred_h * inferred_w)
                         padded[:actual_img_tokens] = rel_map_img
                         padded = padded.reshape(inferred_h, inferred_w)
@@ -338,7 +329,7 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 normalize_image_tokens = False
         else:
             # ViT relevancy map
-            rel_map = rel_map[0,1:].cpu().numpy()
+            rel_map = rel_map[0,1:].float().cpu().numpy()
             num_vit_tokens = len(rel_map)
             vit_grid = int(np.sqrt(num_vit_tokens))
             if vit_grid * vit_grid == num_vit_tokens:
@@ -514,19 +505,21 @@ def boxes_click_handler(image, box_grid, event: gr.SelectData):
             return image,box_grid
 
 def plot_attention_analysis(state, attn_modality_select):
+    logger.info(f"plot_attention_analysis called with modality={attn_modality_select}")
+    
+    if not hasattr(state, 'attention_key'):
+        logger.warning("No attention_key found in state")
+        return state, None
+    
     fn_attention = state.attention_key + '_attn.pt'
-    recovered_image = state.recovered_image
-    img_idx = state.image_idx
+    recovered_image = getattr(state, 'recovered_image', None)
+    img_idx = getattr(state, 'image_idx', 0)
     
     # Get model-specific parameters
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
-    image_grid_hw = getattr(state, 'image_grid_hw', None)
     
     # Calculate grid dimensions
-    if image_grid_hw is not None:
-        grid_h, grid_w = image_grid_hw
-    elif num_image_tokens == 576:
+    if num_image_tokens == 576:
         grid_h, grid_w = 24, 24
     else:
         grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
@@ -564,17 +557,14 @@ def plot_attention_analysis(state, attn_modality_select):
                         target_size = 24  # Standard output size
                         
                         if actual_tokens == num_image_tokens and actual_tokens == grid_h * grid_w:
-                            # Reshape to actual grid dimensions (may be non-square for Qwen VL)
+                            # Reshape to actual grid dimensions
                             attn_grid = attn_slice.reshape(grid_h, grid_w).numpy()
                             # Resize to standard visualization size
                             zoom_factors = (target_size / grid_h, target_size / grid_w)
                             img_attn_list.append(torch.tensor(zoom(attn_grid, zoom_factors, order=1)))
                         else:
                             # Fallback: interpolate to standard grid
-                            if image_grid_hw is not None:
-                                inferred_h, inferred_w = image_grid_hw
-                            else:
-                                inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
+                            inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
                             padded = torch.zeros(inferred_h * inferred_w)
                             padded[:actual_tokens] = attn_slice
                             padded = padded.reshape(inferred_h, inferred_w).numpy()
@@ -609,21 +599,26 @@ def plot_attention_analysis(state, attn_modality_select):
     return state, fig
 
 def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
+    logger.info(f"plot_text_to_image_analysis called with layer={layer_idx}, head={head_idx}")
+
+    if not hasattr(state, 'attention_key'):
+        logger.warning("No attention_key found in state")
+        return state, None, None
+    
+    img_recover = getattr(state, 'recovered_image', None)
+    if img_recover is None:
+        logger.warning("No recovered_image found - cannot plot attention")
+        return state, None, None
 
     fn_attention = state.attention_key + '_attn.pt'
-    img_recover = state.recovered_image
     img_idx = state.image_idx
     generated_text = state.output_ids_decoded
     
     # Get model-specific parameters
     num_image_tokens = getattr(state, 'num_image_tokens', 576)
-    # For Qwen VL: get actual grid dimensions (height, width) for proper aspect ratio
-    image_grid_hw = getattr(state, 'image_grid_hw', None)
     
     # Calculate grid dimensions
-    if image_grid_hw is not None:
-        grid_h, grid_w = image_grid_hw
-    elif num_image_tokens == 576:
+    if num_image_tokens == 576:
         grid_h, grid_w = 24, 24
     else:
         grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
@@ -661,19 +656,16 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
                 from scipy.ndimage import zoom
                 
                 if actual_tokens == num_image_tokens and actual_tokens == grid_h * grid_w:
-                    # Reshape to actual grid dimensions (may be non-square for Qwen VL)
-                    att_grid = att_raw.reshape(grid_h, grid_w).cpu().numpy()
+                    # Reshape to actual grid dimensions
+                    att_grid = att_raw.reshape(grid_h, grid_w).cpu().float().numpy()
                     # Resize to standard visualization size
                     zoom_factors = (target_size / grid_h, target_size / grid_w)
                     att_img = torch.tensor(zoom(att_grid, zoom_factors, order=1))
                 else:
                     # Fallback: interpolate to standard grid
-                    if image_grid_hw is not None:
-                        inferred_h, inferred_w = image_grid_hw
-                    else:
-                        inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
+                    inferred_h = inferred_w = int(np.ceil(np.sqrt(actual_tokens)))
                     padded = torch.zeros(inferred_h * inferred_w)
-                    padded[:actual_tokens] = att_raw
+                    padded[:actual_tokens] = att_raw.float()
                     padded = padded.reshape(inferred_h, inferred_w).cpu().numpy()
                     zoom_factors = (target_size / inferred_h, target_size / inferred_w)
                     att_img = torch.tensor(zoom(padded, zoom_factors, order=1))

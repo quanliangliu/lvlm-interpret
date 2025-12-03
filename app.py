@@ -15,7 +15,6 @@ logging.basicConfig(level=logging.INFO)
 # Supported models:
 # - LLaVA models: "Intel/llava-gemma-2b", "Intel/llava-gemma-7b", "llava-hf/llava-1.5-7b-hf", etc.
 # - Llama 3.2 Vision models: "meta-llama/Llama-3.2-11B-Vision-Instruct", "meta-llama/Llama-3.2-90B-Vision-Instruct"
-# - Qwen VL models: "Qwen/Qwen2-VL-2B-Instruct", "Qwen/Qwen2.5-VL-2B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", etc.
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
