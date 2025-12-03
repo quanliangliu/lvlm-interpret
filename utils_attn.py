@@ -57,14 +57,32 @@ def convert_token2word(R_i_i, tokens, separators_list):
 
 def draw_heatmap_on_image(mat, img_recover, normalize=True):
     if normalize:
-        mat = (mat - mat.min()) / (mat.max() - mat.min())
-    mat = cmap(mat)  #.cpu().numpy())
-    mat = Image.fromarray((mat[:, :, :3] * 255).astype(np.uint8)).resize((336,336), Image.BICUBIC)
-    mat.putalpha(128)
-    img_overlay_attn = img_recover.copy()
-    img_overlay_attn.paste(mat, mask=mat)
+        mat_min = mat.min()
+        mat_max = mat.max()
+        mat_range = mat_max - mat_min
+        if mat_range > 1e-8:
+            mat = (mat - mat_min) / mat_range
+        else:
+            # All values are the same, create a uniform mid-value
+            mat = np.ones_like(mat) * 0.5
+            logger.warning(f"Heatmap has no variation (min={mat_min}, max={mat_max}), using uniform values")
     
-    return img_overlay_attn
+    # Ensure mat is a valid numpy array
+    if hasattr(mat, 'cpu'):
+        mat = mat.cpu().numpy()
+    mat = np.array(mat, dtype=np.float32)
+    
+    # Log heatmap statistics for debugging
+    logger.debug(f"Heatmap stats: min={mat.min():.4f}, max={mat.max():.4f}, mean={mat.mean():.4f}, shape={mat.shape}")
+    
+    mat = cmap(mat)
+    mat = Image.fromarray((mat[:, :, :3] * 255).astype(np.uint8)).resize((336,336), Image.BICUBIC)
+    mat.putalpha(180)  # Increased alpha for more visible overlay
+    img_overlay_attn = img_recover.copy().convert('RGBA')
+    mat = mat.convert('RGBA')
+    img_overlay_attn = Image.alpha_composite(img_overlay_attn, mat)
+    
+    return img_overlay_attn.convert('RGB')
 
 def attn_update_slider(state):
     fn_attention = state.attention_key + '_attn.pt'
@@ -106,32 +124,48 @@ def handle_attentions_i2t(state, highlighted_text, layer_idx=32, token_idx=0):
             logger.warning(f"Non-square image token count: {num_image_tokens}, using grid_size={grid_h}")
 
     if highlighted_text is not None:
-        generated_text = state.output_ids_decoded
-        token_idx_map = dict((t,i) for i,t in enumerate(generated_text))
+        decoded_tokens = getattr(state, 'output_ids_decoded', [])
         token_idx_list = []
-        for item in highlighted_text:
-            label = item['class_or_confidence']
-            if label is None:
-                continue
-            tokens = item['token'].split(' ')
+        decoded_pointer = 0
+        generated_text = []
 
-            for tok in tokens:
-                tok = tok.strip(' ')
-                if tok in token_idx_map:
-                    token_idx_list.append(token_idx_map[tok])
-                else:
-                    logger.warning(f'{tok} not found in generated text')
+        for item in highlighted_text:
+            if isinstance(item, dict):
+                token = item.get('token', '')
+                label = item.get('class_or_confidence')
+            elif isinstance(item, (list, tuple)) and item:
+                token = item[0]
+                label = item[1] if len(item) > 1 else None
+            else:
+                token, label = '', None
+            generated_text.append((token, label))
+
+            if not token or token.isspace():
+                continue
+
+            if decoded_pointer >= len(decoded_tokens):
+                logger.warning(
+                    f"Received more tokens ({decoded_pointer + 1}) from UI than available decoded outputs ({len(decoded_tokens)})."
+                )
+                continue
+
+            if label is not None:
+                token_idx_list.append(decoded_pointer)
+
+            decoded_pointer += 1
 
         if not token_idx_list:
-            logger.info(highlighted_text)
-            logger.info(generated_text)
-            gr.Error(f"Selected text not found in generated output")
+            logger.info("No tokens selected – defaulting to first generated token.")
+            token_idx_list = [0] if decoded_tokens else []
+
+        if not token_idx_list:
+            gr.Error("No generated tokens available for attention.")
             return None, None, [], None
-        
-        generated_text = []
-        for data in highlighted_text:
-            generated_text.extend([(data['token'], None if data['class_or_confidence'] is None else "'"), (' ', None)])
     else:
+        if not getattr(state, 'output_ids_decoded', []):
+            gr.Error("No generated tokens available for attention.")
+            return None, None, [], None
+
         token_idx_list = [0]
 
         generated_text = []
@@ -254,15 +288,20 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
     word_rel_map = word_rel_maps[type_selector]
     image_list = []
     i = 0
+    logger.info(f"Processing {len(word_rel_map)} relevancy maps for type={type_selector}, img_idx={img_idx}, num_image_tokens={num_image_tokens}")
     for rel_key, rel_map in word_rel_map.items():
         i+=1
         if rel_key in separators_list:
             continue
-        if (rel_map.shape[-1] != num_image_tokens + 1) and img_idx:
+        logger.debug(f"Processing rel_key={rel_key}, rel_map.shape={rel_map.shape}")
+        condition_check = (rel_map.shape[-1] != num_image_tokens + 1) and img_idx
+        logger.debug(f"Condition: rel_map.shape[-1]={rel_map.shape[-1]}, num_image_tokens+1={num_image_tokens+1}, img_idx={img_idx}, result={condition_check}")
+        if condition_check:
             if not incude_text_relevancy:
                 img_end_idx = min(img_idx + num_image_tokens, rel_map.shape[-1])
                 actual_img_tokens = img_end_idx - img_idx
                 rel_map_img = rel_map[-1,:][img_idx:img_end_idx].float().cpu().numpy()
+                logger.debug(f"rel_map_img stats: min={rel_map_img.min():.4f}, max={rel_map_img.max():.4f}, shape={rel_map_img.shape}")
                 
                 # Reshape to grid using actual dimensions, handling non-square grids
                 from scipy.ndimage import zoom
@@ -295,16 +334,19 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 text_start_idx = img_end_idx + 3
                 text_end_idx = min(num_image_tokens + input_text_tokenized_len - 1 - 5, rel_map.shape[-1])
                 
+                logger.debug(f"incude_text_relevancy branch: img_idx={img_idx_int}, img_end_idx={img_end_idx}, text_start_idx={text_start_idx}, text_end_idx={text_end_idx}")
+                
                 rel_maps_img = rel_map[-1,:][img_idx_int:img_end_idx]
                 rel_maps_text = rel_map[-1,:][text_start_idx:text_end_idx] if text_start_idx < text_end_idx else torch.tensor([])
                 rel_maps_no_system = torch.cat((rel_maps_img, rel_maps_text))
                 
-                logger.debug(f'shape of rel_maps_no_system: {rel_maps_no_system.shape}')
+                logger.debug(f'shape of rel_maps_no_system: {rel_maps_no_system.shape}, raw stats: min={rel_maps_no_system.min():.4f}, max={rel_maps_no_system.max():.4f}')
                 rel_maps_no_system = (rel_maps_no_system - rel_maps_no_system.min()) / (rel_maps_no_system.max() - rel_maps_no_system.min() + 1e-8)
                 
                 # Get image portion and reshape using actual grid dimensions
                 actual_img_tokens = img_end_idx - img_idx_int
                 rel_map_img = rel_maps_no_system[:actual_img_tokens].float().cpu().numpy()
+                logger.debug(f"actual_img_tokens={actual_img_tokens}, rel_map_img stats: min={rel_map_img.min():.4f}, max={rel_map_img.max():.4f}")
                 
                 from scipy.ndimage import zoom
                 target_size = 24  # Standard output size for visualization
@@ -326,7 +368,8 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                         rel_map = zoom(padded, zoom_factors, order=1)
                     else:
                         rel_map = np.zeros((target_size, target_size))
-                normalize_image_tokens = False
+                # Always normalize the image portion since it may not span 0-1 after extraction
+                normalize_image_tokens = True
         else:
             # ViT relevancy map
             rel_map = rel_map[0,1:].float().cpu().numpy()
@@ -343,6 +386,7 @@ def handle_relevancy(state, type_selector,incude_text_relevancy=False):
                 zoom_factor = 24 / side
                 rel_map = zoom(padded, zoom_factor, order=1)
             normalize_image_tokens = True
+        logger.info(f"Before draw_heatmap: rel_map.shape={rel_map.shape}, rel_map stats: min={rel_map.min():.4f}, max={rel_map.max():.4f}, normalize={normalize_image_tokens}")
         rel_map = draw_heatmap_on_image(rel_map, recovered_image, normalize=normalize_image_tokens)
         # strip _ from all rel keys
         rel_key = rel_key.strip('▁').strip('_')
@@ -411,14 +455,31 @@ def handle_text_relevancy(state, type_selector):
                 if len(current_relevency) > expected_len:
                     current_relevency = current_relevency[:expected_len]
             
-            offset = min(img_idx + 3, len(current_relevency))
-            end_offset = max(0, len(current_relevency) - 5)
-            if offset < end_offset:
+            # After collapsing image tokens to single avg value, structure is:
+            # [tokens_before_img | avg_img_token | tokens_after_img]
+            # We want to skip system prompt (before img_idx) and keep user text (after collapsed img token)
+            # The collapsed image token is at index img_idx, so user text starts at img_idx + 1
+            
+            # Skip system prompt tokens (before image) but keep image avg and everything after
+            # Also skip last few tokens (typically EOS/padding)
+            offset = img_idx + 1  # Start after the collapsed image token
+            end_offset = max(offset, len(current_relevency) - 2)  # Keep more tokens, only skip last 2
+            
+            if offset < len(current_relevency) and offset < end_offset:
                 current_relevency = current_relevency[offset:end_offset]
-                input_text_tokenized = input_text_tokenized_all[offset:end_offset] if offset < len(input_text_tokenized_all) else []
+                # Align input_text_tokenized with the same offset
+                # Note: input_text_tokenized_all still has original structure with all image tokens
+                # We need to map: offset in collapsed -> offset in original
+                # collapsed[img_idx+1] corresponds to original[img_idx + num_image_tokens]
+                original_offset = img_idx + num_image_tokens
+                original_end = original_offset + (end_offset - offset)
+                input_text_tokenized = input_text_tokenized_all[original_offset:original_end] if original_offset < len(input_text_tokenized_all) else []
+                logger.debug(f"Relevancy slice: offset={offset}, end_offset={end_offset}, original_offset={original_offset}, len(input_text_tokenized)={len(input_text_tokenized)}")
             else:
+                # Fallback: use all tokens
                 current_relevency = current_relevency
                 input_text_tokenized = input_text_tokenized_all
+                logger.debug("Using all tokens for relevancy (fallback)")
                 
             if len(input_text_tokenized) > 0 and len(current_relevency) > 0:
                 input_text_tokenized_word, current_relevency_word = convert_token2word(current_relevency, input_text_tokenized, separators_list)
@@ -463,32 +524,48 @@ def handle_text_relevancy(state, type_selector):
 
         return all_figs, highlighted_tokens
 
-def handle_image_click(image,box_grid, x, y):
+def handle_image_click(image, box_grid, x, y):
+    # If box_grid is empty or wrong size, create a new one
+    if box_grid is None or box_grid.size == 0 or box_grid.shape != (24, 24):
+        box_grid = np.zeros((24, 24), dtype=bool)
+    
     # Calculate which box was clicked
-    box_width = image.size[1] // 24
-    box_height = image.size[0] // 24
+    # image.size returns (width, height) for PIL images
+    box_width = image.size[0] // 24   # width / 24
+    box_height = image.size[1] // 24  # height / 24
 
-    box_x = x // box_width
-    box_y = y // box_height
+    # x is horizontal (column), y is vertical (row)
+    box_col = x // box_width
+    box_row = y // box_height
+    
+    # Clamp to valid range
+    box_col = min(max(box_col, 0), 23)
+    box_row = min(max(box_row, 0), 23)
 
-    box_grid[box_x][box_y] = not box_grid[box_x][box_y]
+    # box_grid is indexed as [row][col] for consistency with numpy/matplotlib
+    box_grid[box_row][box_col] = not box_grid[box_row][box_col]
+    logger.info(f"Toggled patch at row={box_row}, col={box_col}, value={box_grid[box_row][box_col]}")
     
     # Add a transparent teal box to the image at the clicked location
     overlay = image.copy()
     draw = ImageDraw.Draw(overlay)
     indices = np.where(box_grid)
-    for i, j in zip(*indices):
-        draw.rectangle([(i * box_width, j * box_height), ((i + 1) * box_width, (j + 1) * box_height)], fill=(255, 100, 100, 128))
+    for row, col in zip(*indices):
+        draw.rectangle([(col * box_width, row * box_height), ((col + 1) * box_width, (row + 1) * box_height)], fill=(255, 100, 100, 128))
 
     image = Image.blend(image, overlay, alpha=0.8)
 
     # Return the updated image
     return image, box_grid
 
-def handle_box_reset(input_image,box_grid): 
-    for i in range(24):
-        for j in range(24):
-            box_grid[i][j] = False
+def handle_box_reset(input_image, box_grid): 
+    # If box_grid is empty or wrong size, create a new one
+    if box_grid is None or box_grid.size == 0 or box_grid.shape != (24, 24):
+        box_grid = np.zeros((24, 24), dtype=bool)
+    else:
+        for i in range(24):
+            for j in range(24):
+                box_grid[i][j] = False
     try:
         to_return = input_image.copy()
     except:
@@ -497,12 +574,15 @@ def handle_box_reset(input_image,box_grid):
 
 
 def boxes_click_handler(image, box_grid, event: gr.SelectData):
-    if event is not None:
-        x, y = event.index[0], event.index[1]
-
-        image,box_grid = handle_image_click(image,box_grid, x, y)
-        if x is not None and y is not None:
-            return image,box_grid
+    if event is None:
+        return image, box_grid
+    
+    x, y = event.index[0], event.index[1]
+    if x is None or y is None:
+        return image, box_grid
+    
+    image, box_grid = handle_image_click(image, box_grid, x, y)
+    return image, box_grid
 
 def plot_attention_analysis(state, attn_modality_select):
     logger.info(f"plot_attention_analysis called with modality={attn_modality_select}")
@@ -623,12 +703,17 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
     else:
         grid_h = grid_w = int(np.sqrt(num_image_tokens)) if num_image_tokens > 1 else 24
 
-    # Sliders start at 1
+    # Sliders start at 1, convert to 0-indexed
     head_idx -= 1
     layer_idx -= 1
-    img_patches = [(j, i) for i, row in enumerate(boxes) for j, clicked in enumerate(row) if clicked]
+    
+    # boxes is indexed as [row][col], extract selected patches as (row, col) tuples
+    # This matches the attention tensor indexing of [head, token, row, col]
+    img_patches = [(i, j) for i, row in enumerate(boxes) for j, clicked in enumerate(row) if clicked]
+    logger.info(f"Selected patches from boxes: {img_patches}, boxes shape: {np.array(boxes).shape}, sum of selected: {np.sum(boxes)}")
     if len(img_patches) == 0:
-        img_patches = [(5,5)]
+        img_patches = [(5, 5)]
+        logger.info("No patches selected, using default (5, 5)")
     if os.path.exists(fn_attention):
         attentions = torch.load(fn_attention)
         logger.info(f'Loaded attention from {fn_attention}')
@@ -636,6 +721,11 @@ def plot_text_to_image_analysis(state, layer_idx, boxes, head_idx=1 ):
             gr.Error('Mismatch between lengths of attentions and output tokens')
         
         batch_size, num_heads, inp_seq_len, seq_len = attentions[0][0].shape
+        
+        # Clamp head_idx to valid range (0 to num_heads-1)
+        head_idx = min(max(head_idx, 0), num_heads - 1)
+        logger.info(f"Using head_idx={head_idx} (num_heads={num_heads})")
+        
         generated_text = state.output_ids_decoded
     
     else:

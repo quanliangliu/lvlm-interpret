@@ -477,11 +477,11 @@ def build_demo(args, embed_mode=False):
                     i2t_attn_head_mean_plot = gr.Plot(label="Image-to-Text attention average per head")
                     i2t_attn_gallery = gr.Gallery(type="pil", label='Attention heatmaps', columns=8, interactive=False)
 
-            box_states = gr.Dataframe(type="numpy", datatype="bool", row_count=24, col_count=24, visible=False) 
+            box_states = gr.State(value=np.zeros((24, 24), dtype=bool)) 
             with gr.Row(equal_height=True):
                 with gr.Column(scale=3):
                     imagebox_recover_boxable = gr.Image(label='Patch Selector')
-                    attn_ana_head= gr.Slider(1, 40, step=1, label="Head Index")
+                    attn_ana_head= gr.Slider(1, 32, step=1, label="Head Index", value=1)
             
                     reset_boxes_btn = gr.Button(value="Reset patch selector")
                     attn_ana_submit_2 = gr.Button(value="Plot attention matrix", interactive=True)
